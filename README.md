@@ -33,7 +33,7 @@ unisoc-cpd                     one binary, one profile
 
 ```sh
 cargo build --release          # host
-cargo test                     # 98 tests, no device needed
+cargo test                     # 104 tests, no device needed
 ```
 
 The tests run against a fake CP on a **pty**, which is the only honest stand-in
@@ -91,7 +91,14 @@ unisoc-cpd --profile e5 --mode native serve --socket /run/unisoc-cpd/cmd.sock
 unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock sim
 unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock state   # the daemon's own state
 unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock urc     # decoded URC events
+unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock messages # messages the daemon read on its own (MT)
 ```
+
+`serve` acts on `+CMTI:` by itself: when the modem announces a message, the
+daemon reads it with `AT+CMGR` between requests (read-only — it never deletes;
+PDU mode is not decoded and is reported as such), and a client collects the
+result with `messages`.  Sending is `sms send <number> <text>` (the MO path,
+whose `>` continuation prompt the AT layer already handles).
 
 What is asked for is a **capability**, never a raw AT string: raw AT over a
 socket would move the one-reader rule out of the one process that enforces it.
@@ -151,7 +158,7 @@ systemctl stop e5-mobile-data-watch e5-mobile-data e5-atd
 
 | | |
 |---|---|
-| core (channel/at/telemetry/profile/CLI) | implemented, 98 tests green |
+| core (channel/at/telemetry/profile/CLI) | implemented, 104 tests green |
 | capabilities | `link`, `sim`, `register`, `signal`, `operator`, `cfun`, `band`, `nr`, `ims`, `sms`, `ussd`, `call`, `data`, `nv`, `diag`, `serve` |
 | URC decoding (contracts §9.2) | implemented and tested; `+ECIND:`/`+CMT:`/`+CDS:` deliberately kept raw rather than half-decoded |
 | G2 control plane (`serve`) | code and offline tests in place: resident ownership, URC events, capabilities over a socket, idle probes, `state` with `last_ok_age_s`. **Not yet on the device** — it has not been the owner of `/dev/stty_nr1` |

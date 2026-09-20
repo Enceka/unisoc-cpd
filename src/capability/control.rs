@@ -8,6 +8,7 @@
 use super::{emit, flag_value, positionals, Capability, Outcome};
 use crate::context::Context;
 use anyhow::Result;
+use serde::Serialize;
 use std::time::Duration;
 
 fn outcome(lines: Vec<String>, ok: bool) -> Outcome {
@@ -432,6 +433,87 @@ impl Capability for Sms {
     }
 }
 
+// ------------------------------------------------------- a text-mode message
+
+/// One message as the modem reported it, parsed out of an `AT+CMGR` reply in
+/// text mode.  This is the shape the resident owner hands a client when the
+/// modem announces a message with `+CMTI:` — the MT half of A5.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TextMessage {
+    /// The storage the `+CMTI` named (`"SM"`, `"ME"`); filled in by the caller,
+    /// because the `CMGR` reply does not carry it.
+    pub storage: String,
+    pub index: u32,
+    /// The modem's own status word: `REC UNREAD`, `REC READ`, `STO SENT`, …
+    pub status: String,
+    /// Originator address, as reported (MO storage entries report the
+    /// destination here instead — the field is `<oa>/<da>`).
+    pub from: String,
+    /// The service-centre timestamp, verbatim (`"26/09/20,10:00:00+32"`).
+    pub timestamp: String,
+    pub text: String,
+}
+
+/// Comma-split with quote awareness.  Two things make a naive `split(',')`
+/// wrong here: a quoted field may contain commas (the service-centre timestamp
+/// does), and an *empty* field is still a field (the alphabet name between the
+/// address and the timestamp usually is — losing it shifts every later field).
+fn split_fields(body: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for c in body.chars() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                fields.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+    fields.push(current.trim().to_string());
+    fields
+}
+
+/// The status words a text-mode `+CMGR` header may carry (27.005).  Anything
+/// else means the reply is not a text-mode message — PDU mode answers with a
+/// bare length, and this daemon does not decode PDU, so it must say so rather
+/// than hand back hex dressed up as a text.
+const CMGR_TEXT_STATUSES: &[&str] = &["REC UNREAD", "REC READ", "STO UNSENT", "STO SENT", "ALL"];
+
+/// Parse the reply lines of `AT+CMGR=<index>` in text mode: a `+CMGR:` header
+/// of comma-separated quoted fields, then the body up to the final result
+/// code, which the caller's `lines` already excludes (`Reply.lines`).
+///
+/// `None` means "not a text-mode message": no header, or a header that does
+/// not carry one of the 27.005 status words.
+pub fn parse_cmgr(index: u32, lines: &[String]) -> Option<TextMessage> {
+    let header = lines.iter().find(|l| l.starts_with("+CMGR:"))?;
+    let fields = split_fields(header.split_once(':')?.1);
+
+    let status = fields.first()?.to_ascii_uppercase();
+    if !CMGR_TEXT_STATUSES.contains(&status.as_str()) {
+        return None;
+    }
+
+    let text = lines
+        .iter()
+        .filter(|l| !l.starts_with("+CMGR:"))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Some(TextMessage {
+        storage: String::new(),
+        index,
+        status,
+        from: fields.get(1).cloned().unwrap_or_default(),
+        timestamp: fields.get(3).cloned().unwrap_or_default(),
+        text,
+    })
+}
+
 // ---------------------------------------------------------------------- USSD
 
 pub struct Ussd;
@@ -574,6 +656,44 @@ mod tests {
         assert_eq!(rsrp, Some(-80));
         assert_eq!(rsrq, Some(-9.5));
         assert_eq!(sinr, None);
+    }
+
+    #[test]
+    fn a_cmgr_reply_parses_into_a_message() {
+        // The shape that matters: an empty alphabet field between the address
+        // and the timestamp, and a comma *inside* the timestamp's quotes.
+        let lines = vec![
+            "+CMGR: \"REC UNREAD\",\"+8613800138000\",,\"26/09/20,10:00:00+32\"".to_string(),
+            "hello, world".to_string(),
+        ];
+        let message = parse_cmgr(7, &lines).unwrap();
+        assert_eq!(message.index, 7);
+        assert_eq!(message.status, "REC UNREAD");
+        assert_eq!(message.from, "+8613800138000");
+        assert_eq!(message.timestamp, "26/09/20,10:00:00+32");
+        assert_eq!(message.text, "hello, world");
+        assert_eq!(message.storage, "");
+    }
+
+    #[test]
+    fn a_multi_line_body_stays_whole() {
+        let lines = vec![
+            "+CMGR: \"REC READ\",\"10086\",\"CMCC\",\"26/09/20,10:00:00+32\"".to_string(),
+            "line one".to_string(),
+            "line two".to_string(),
+        ];
+        let message = parse_cmgr(1, &lines).unwrap();
+        assert_eq!(message.from, "10086");
+        assert_eq!(message.timestamp, "26/09/20,10:00:00+32");
+        assert_eq!(message.text, "line one\nline two");
+    }
+
+    #[test]
+    fn a_pdu_mode_reply_is_refused_not_misread() {
+        // PDU mode answers with a bare length; handing hex back as text would
+        // be exactly the kind of quiet lie this module exists to avoid.
+        assert!(parse_cmgr(3, &["+CMGR: 25".to_string(), "07914477".to_string()]).is_none());
+        assert!(parse_cmgr(3, &[]).is_none());
     }
 
     #[test]

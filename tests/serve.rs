@@ -370,6 +370,89 @@ fn the_daemon_decodes_the_unsolicited_stream_it_owns() {
     );
 }
 
+/// A5's MT half, end to end: the modem announces a message with `+CMTI:` while
+/// nobody is asking for anything, the daemon reads it on its own between
+/// requests, and a client gets the whole message — sender, timestamp, text —
+/// without ever touching the channel.
+#[test]
+fn an_announced_message_is_read_and_handed_to_clients() {
+    let (cmd_master, cmd_slave) = pty_pair();
+    let (urc_master, urc_slave) = pty_pair();
+    let modem = fake_modem(cmd_master);
+    let mut urc_writer = urc_master;
+    let dir = scratch("serve-mt");
+    let profile = write_profile(&dir, &cmd_slave, Some(&urc_slave), "");
+    let runs = dir.join("runs");
+    let state_dir = dir.join("state");
+    let socket = state_dir.join("cmd.sock");
+
+    let _daemon = Daemon::start(&socket, &profile, &runs, &state_dir, &[]);
+
+    // The network delivers a message into slot 7 of the SIM.
+    urc_writer
+        .write_all(b"+CMTI: \"SM\",7\r\n")
+        .expect("announce the message");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let messages = loop {
+        let answer = ask(&socket, &json!({"action": "messages"}));
+        let got = answer["messages"].as_array().cloned().unwrap_or_default();
+        if !got.is_empty() {
+            break got;
+        }
+        if Instant::now() >= deadline {
+            panic!("the daemon did not read the announced message: {answer:#}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    // The read went to the slot the announcement named, not to a guess.
+    assert!(modem.wait_for_command("AT+CMGR=7", Duration::from_secs(2)));
+
+    assert_eq!(messages.len(), 1, "{messages:#?}");
+    let message = &messages[0];
+    assert_eq!(message["storage"], "SM", "{message:#}");
+    assert_eq!(message["index"], 7, "{message:#}");
+    assert_eq!(message["status"], "REC UNREAD", "{message:#}");
+    assert_eq!(message["from"], "+8613800138000", "{message:#}");
+    assert_eq!(message["timestamp"], "26/09/20,10:00:00+32", "{message:#}");
+    assert_eq!(message["text"], "hello from index 7", "{message:#}");
+
+    // The announcement is in the decoded stream, and the daemon's own state
+    // says one announcement became one read with nothing left unparsed.
+    let answer = ask(&socket, &json!({"action": "urc", "limit": 20}));
+    let kinds: Vec<String> = answer["urcs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["urc"]["kind"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(kinds.contains(&"urc-new-message".to_string()), "{kinds:?}");
+
+    let state = ask(&socket, &json!({"action": "state"}))["state"].clone();
+    assert_eq!(state["messages_announced"], 1, "{state:#}");
+    assert_eq!(state["messages_read"], 1, "{state:#}");
+    assert_eq!(state["message_read_failures"], 0, "{state:#}");
+    assert_eq!(state["text_mode"], true, "{state:#}");
+
+    // And the CLI prints it like a message, not like JSON internals.
+    let out = run_cli(
+        &profile,
+        &runs,
+        &state_dir,
+        "messages",
+        &["--socket", socket.to_str().unwrap()],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout:\n{stdout}");
+    assert!(stdout.contains("+8613800138000"), "stdout:\n{stdout}");
+    assert!(stdout.contains("hello from index 7"), "stdout:\n{stdout}");
+    assert!(
+        !stdout.contains("\"status\": \"pass\""),
+        "stdout:\n{stdout}"
+    );
+}
+
 /// A file left behind by a killed daemon must not stop the next one, and a live
 /// daemon must not be joined by a second one on the same socket.
 #[test]

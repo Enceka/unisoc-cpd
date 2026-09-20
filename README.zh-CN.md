@@ -39,7 +39,7 @@ unisoc-cpd / ucpd              一个二进制，一份 profile
 
 ```sh
 cargo build --release        # 主机
-cargo test                   # 98 个测试，不需要设备
+cargo test                   # 104 个测试，不需要设备
 ```
 
 测试跑在一个 **pty 上的伪 CP** 上。pty 是 SIPC tty 唯一诚实的替身：真 tty、两端、驱动按突发交付行。伪 CP 会在**每一条应答里插入一条 URC**，所以"URC 与应答分流"、"限速"、"超时"、`>` 续行提示符这四条路径**每条命令都会被走到**，而不是只在顺利路径上被走到。
@@ -100,7 +100,13 @@ unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock sim
 unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock register status
 unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock state   # 守护进程状态（含 last_ok_age_s）
 unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock urc     # 最近解码出的 URC 事件
+unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock messages # 守护进程自己读到的短信（MT）
 ```
+
+`serve` 会自己对 `+CMTI:` 起反应：modem 一宣布新短信，守护进程就在两个请求
+之间用 `AT+CMGR` 把它读出来（只读，不删；PDU 模式不解码、明说），客户端用
+`messages` 随时取。发短信走 `sms send <号码> <正文>`（MO 路径，`AT+CMGS` 的
+`>` 续行提示符在 AT 层处理）。
 
 契约（URC→事件表、请求/应答、哪些是有意不做的）在
 [`docs/BASEBAND-CONTRACTS.md`](docs/BASEBAND-CONTRACTS.md) §9。
@@ -236,7 +242,7 @@ systemctl stop e5-mobile-data-watch e5-mobile-data e5-atd
 
 | 项目 | 状态 |
 |---|---|
-| 核心（channel / at / telemetry / profile / CLI） | 已实现，98 个测试通过 |
+| 核心（channel / at / telemetry / profile / CLI） | 已实现，104 个测试通过 |
 | `profile-check`（A12 门禁） | 通过（两个 profile，核心无平台名） |
 | URC 解码（契约 §9.2） | 已实现并测试；`+ECIND:`/`+CMT:`/`+CDS:` 有意保持原样，不解码就不假装解码 |
 | **G2 控制面（`serve`）** | 代码与离线测试就绪：常驻独占两条通道、URC 事件、socket 上的能力请求、空闲探活、`state`（含 `last_ok_age_s`）。**未上真机**——还没当过 `/dev/stty_nr1` 的主人 |

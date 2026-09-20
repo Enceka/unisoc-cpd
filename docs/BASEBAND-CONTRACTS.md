@@ -373,18 +373,38 @@ not decode" is evidence, and silence is not.
 | `+SPERROR: …` | this generation's own error report | `urc-sp-error {code, text}` |
 | anything else (`+ECIND:`, `+SPPCODATA:`, `+PRENWINFU:` …) | not decoded yet | `urc-other {line}`, kept verbatim |
 
-Deliberately **not** in this first G2 increment, and why:
+Deliberately **not** here, and why:
 
 * `+CMT:` / `+CDS:` (a message delivered inline) map to `urc-other`.  Inline
   delivery only happens when `AT+CNMI` asks for it; the measured path on this
   generation is `+CMTI:` into storage, and the daemon does not set `CNMI`.
-* Act on `+CMTI:` — read the message, hand it to a client.  Classifying it is
-  the half that has to exist first; the read is A5's MT half.
+* PDU mode.  The daemon sets `AT+CMGF=1` once at start-up and reports
+  `text_mode` in `state`; if the CP refuses text mode it announces messages
+  without reading them rather than handing back hex dressed up as text.
+* Auto-delete.  Reading a message moves it to `REC READ` and that is all —
+  deletion stays with the operator (`sms delete`), because a daemon that
+  tidies up storage can destroy the evidence of its own misreading.
 * `+ECIND:` (`3,0,0,1`, `3,6,1` measured) stays `urc-other`: its fields are not
   established, so guessing them would be worse than reporting them raw.
 * MT call control (`urc-incoming-call` → `ATA`) and a D-Bus/ModemManager face
   in front of the socket, which is what lets `gnome-calls`/`chatty` use any of
   this (plan, `core/api`).
+
+### 9.2.1 Acting on `+CMTI:` — the MT message path
+
+The announcement and the read are deliberately two steps.  A `+CMTI:` can
+arrive *inside* another command's reply loop — the URC sink fires there too —
+and the one thing it must never do is send AT from inside that loop, because
+the session's gate is held by the command in flight.  So the sink only queues
+`(storage, index)`, and the serve loop drains the queue between requests, on
+the same single thread that answers requests.  A repeated announcement of a
+slot that has not been read yet is one read, not two.
+
+A read is `AT+CMGR=<index>` in text mode; the reply parses into
+`{storage, index, status, from, timestamp, text}` (`core/capability/control.rs`,
+which also refuses a PDU-shaped header instead of misreading it).  The daemon
+never deletes what it read; the `+CMTI:` itself still lands in the URC stream
+and in whichever run summary was in flight.
 
 ### 9.3 The request/response contract
 
@@ -404,8 +424,9 @@ status: pass
 | request | answered with |
 | --- | --- |
 | `{"capability":"<name>","args":[…]}` — action defaults to `run` | that capability's own output, `status`, `exit_code`, `notes` |
-| `{"action":"state"}` | the daemon's state: pid, uptime, requests, idle probes, `last_ok_age_s`, channel and AT metrics, URC counts, the last 20 decoded events |
+| `{"action":"state"}` | the daemon's state: pid, uptime, requests, idle probes, `last_ok_age_s`, channel and AT metrics, URC counts, message counts, the last 20 decoded events |
 | `{"action":"urc","limit":N}` | the last `N` decoded URC events, oldest first |
+| `{"action":"messages","limit":N}` | the last `N` messages read on their own after a `+CMTI:` — A5's MT half |
 
 An unknown capability, a malformed line, or asking for `serve` itself is an
 error in the response, not a dropped connection.  Every `run` writes its own

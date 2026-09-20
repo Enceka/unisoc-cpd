@@ -227,6 +227,18 @@ fn respond(w: &mut File, cmd: &str, urcs: &AtomicU64, state: &mut ModemState) {
         "OK\r\n".into()
     } else if upper.starts_with("AT+CMGF") {
         "OK\r\n".into()
+    } else if upper.starts_with("AT+CMGR=") {
+        // A text-mode message whose body names the index it was asked for, so
+        // a test can prove the daemon read the slot the +CMTI announced.
+        let index = upper
+            .trim_start_matches("AT+CMGR=")
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(0);
+        format!(
+            "+CMGR: \"REC UNREAD\",\"+8613800138000\",,\"26/09/20,10:00:00+32\"\r\nhello from index {index}\r\nOK\r\n"
+        )
+        .into()
     } else if upper.starts_with("AT+CMGL") {
         "+CMGL: 1,\"REC READ\",\"+8613800138000\",,\"26/09/20,10:00:00+32\"\r\nhello\r\nOK\r\n"
             .into()

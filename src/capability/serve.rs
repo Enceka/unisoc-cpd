@@ -17,6 +17,7 @@
 //! string.  Raw AT over a socket would move the ownership rule out of the
 //! process that enforces it, and the red line would become a convention again.
 
+use super::control::{parse_cmgr, TextMessage};
 use super::{flag_value, Capability, Outcome, Status};
 use crate::at::AtMetrics;
 use crate::channel::ChannelMetrics;
@@ -28,7 +29,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,9 @@ const KEEP_URCS: usize = 200;
 
 /// How many decoded URCs `state` (and an `urc` request with no `limit`) returns.
 const DEFAULT_EVENT_TAIL: usize = 20;
+
+/// How many read messages are kept for `state` and `messages` to answer with.
+const KEEP_MESSAGES: usize = 50;
 
 pub struct Serve;
 
@@ -86,9 +90,30 @@ fn serve(ctx: &mut Context, socket: &Path, seconds: f64) -> Result<Outcome> {
     let session = ctx.at()?;
 
     let log = Arc::new(UrcLog::default());
+    let inbox = Arc::new(MessageInbox::default());
+
+    // Text mode is what makes a `+CMTI:` worth acting on: without it `CMGR`
+    // hands back PDU hex, which this daemon does not decode and will not
+    // pretend to.
+    let default_timeout = Duration::from_secs_f64(ctx.profile.at.default_timeout.max(1.0));
+    let text_mode = session.command("AT+CMGF=1", default_timeout, &[], 0).ok();
+    inbox.text_mode.store(text_mode, Ordering::SeqCst);
+    if !text_mode {
+        eprintln!(
+            "unisoc-cpd: AT+CMGF=1 was not accepted; incoming messages are \
+             announced but not read"
+        );
+    }
+
     {
         let log = Arc::clone(&log);
-        session.set_urc_sink(Arc::new(move |line: &str| log.record(line)));
+        let inbox = Arc::clone(&inbox);
+        session.set_urc_sink(Arc::new(move |line: &str| {
+            log.record(line);
+            if let Some(urc::Urc::NewMessage { storage, index }) = urc::classify(line) {
+                inbox.announced(&storage, index);
+            }
+        }));
     }
 
     let mut rt = Runtime::new(socket);
@@ -105,7 +130,7 @@ fn serve(ctx: &mut Context, socket: &Path, seconds: f64) -> Result<Outcome> {
                 rt.requests += 1;
                 let mark = log.mark();
                 let answered_before = answered(ctx);
-                if let Err(e) = handle(ctx, &log, &mut rt, mark, conn) {
+                if let Err(e) = handle(ctx, &log, &inbox, &mut rt, mark, conn) {
                     eprintln!("unisoc-cpd: connection: {e:#}");
                 }
                 if answered(ctx) > answered_before {
@@ -120,6 +145,8 @@ fn serve(ctx: &mut Context, socket: &Path, seconds: f64) -> Result<Outcome> {
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
+
+        read_announced(&inbox, &session, default_timeout);
 
         // A probe is a real command, not a liveness ping: "is the CP still
         // answering AT" is the question, and the only one allowed to drive a
@@ -147,7 +174,51 @@ fn serve(ctx: &mut Context, socket: &Path, seconds: f64) -> Result<Outcome> {
         format!("requests {}", rt.requests),
         format!("idle probes {} ({} failed)", rt.probes, rt.probe_failures),
         format!("URC lines {lines}, decoded {decoded}"),
+        format!(
+            "messages announced {}, read {} ({} unparsed)",
+            inbox.announced.load(Ordering::SeqCst),
+            inbox.reads.load(Ordering::SeqCst),
+            inbox.read_failures.load(Ordering::SeqCst)
+        ),
     ]))
+}
+
+/// The MT half: read every message the modem announced, between requests.
+///
+/// This runs on the same single thread that answers requests, which is the
+/// whole trick: a `+CMTI:` may arrive *inside* a command's reply loop (the
+/// URC sink fires there too), and the one thing it must never do is send AT
+/// from inside that loop — the session's gate is held by the command in
+/// flight.  So the sink only queues, and the queue is drained here, where
+/// taking the gate is safe.
+fn read_announced(inbox: &MessageInbox, session: &crate::at::AtSession, timeout: Duration) {
+    let text_mode = inbox.text_mode.load(Ordering::SeqCst);
+    for (storage, index) in inbox.drain() {
+        let cmd = format!("AT+CMGR={index}");
+        if !text_mode {
+            eprintln!("unisoc-cpd: {storage}[{index}] announced but text mode is off; not read");
+            continue;
+        }
+        inbox.reads.fetch_add(1, Ordering::SeqCst);
+        let reply = session.command(&cmd, timeout, &["+CMGR:".to_string()], 0);
+        match parse_cmgr(index, &reply.lines) {
+            Some(mut message) => {
+                message.storage = storage.clone();
+                eprintln!(
+                    "unisoc-cpd: message from {} in {}[{}]: {}",
+                    message.from, message.storage, message.index, message.text
+                );
+                inbox.deliver(message);
+            }
+            None => {
+                inbox.read_failures.fetch_add(1, Ordering::SeqCst);
+                eprintln!(
+                    "unisoc-cpd: the reply to {cmd} is not a text-mode message: {:?}",
+                    reply.lines
+                );
+            }
+        }
+    }
 }
 
 /// Bind the socket, refusing to steal one that a live daemon is serving.
@@ -240,12 +311,68 @@ impl UrcLog {
     }
 }
 
+// ------------------------------------------------------------- the MT half
+
+/// Messages the modem has announced, and the ones we have read.
+///
+/// The announcement and the read are deliberately two steps: a `+CMTI:` can
+/// arrive inside another command's reply loop, where sending AT is forbidden,
+/// so it is queued here and read by the serve loop between requests.
+#[derive(Default)]
+struct MessageInbox {
+    /// Whether `AT+CMGF=1` was accepted at start-up: text mode is what makes a
+    /// `+CMTI:` readable, and its absence is reported rather than worked
+    /// around (PDU is not decoded here).
+    text_mode: AtomicBool,
+    /// How many `+CMTI:` this daemon has seen.
+    announced: AtomicU64,
+    /// How many `AT+CMGR` reads it has made for them.
+    reads: AtomicU64,
+    read_failures: AtomicU64,
+    pending: Mutex<VecDeque<(String, u32)>>,
+    delivered: Mutex<VecDeque<TextMessage>>,
+}
+
+impl MessageInbox {
+    /// A `+CMTI: "<storage>",<index>`.  The same slot announced twice before
+    /// it has been read is one read, not two.
+    fn announced(&self, storage: &str, index: u32) {
+        self.announced.fetch_add(1, Ordering::SeqCst);
+        let mut pending = self.pending.lock().unwrap();
+        if pending.iter().any(|(s, i)| s == storage && *i == index) {
+            return;
+        }
+        pending.push_back((storage.to_string(), index));
+    }
+
+    /// Announcements to read now, oldest first.
+    fn drain(&self) -> Vec<(String, u32)> {
+        self.pending.lock().unwrap().drain(..).collect()
+    }
+
+    /// A message that has been read; the newest `KEEP_MESSAGES` are kept.
+    fn deliver(&self, message: TextMessage) {
+        let mut delivered = self.delivered.lock().unwrap();
+        if delivered.len() >= KEEP_MESSAGES {
+            delivered.pop_front();
+        }
+        delivered.push_back(message);
+    }
+
+    /// The last `limit` messages, oldest first.
+    fn messages(&self, limit: usize) -> Vec<TextMessage> {
+        let delivered = self.delivered.lock().unwrap();
+        let skip = delivered.len().saturating_sub(limit);
+        delivered.iter().skip(skip).cloned().collect()
+    }
+}
+
 // --------------------------------------------------------------- the protocol
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct Request {
-    /// `run` (the default), `state` or `urc`.
+    /// `run` (the default), `state`, `urc` or `messages`.
     action: String,
     capability: String,
     args: Vec<String>,
@@ -268,6 +395,8 @@ struct Response {
     state: Option<State>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     urcs: Vec<UrcEvent>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    messages: Vec<TextMessage>,
 }
 
 impl Response {
@@ -299,6 +428,15 @@ struct State {
     urc_lines: u64,
     urc_decoded: u64,
     urc_undecoded: u64,
+    /// Text mode is what makes a `+CMTI:` readable; its absence is reported,
+    /// never silently worked around.
+    text_mode: bool,
+    /// Announcements seen / reads made / reads that were not a text message.
+    messages_announced: u64,
+    messages_read: u64,
+    message_read_failures: u64,
+    /// How many read messages are kept in the inbox.
+    messages_kept: usize,
     events: Vec<UrcEvent>,
 }
 
@@ -333,6 +471,7 @@ impl Runtime {
 fn handle(
     ctx: &mut Context,
     log: &UrcLog,
+    inbox: &MessageInbox,
     rt: &mut Runtime,
     mark: u64,
     conn: UnixStream,
@@ -347,7 +486,7 @@ fn handle(
     // One request per connection, one JSON object per line: the shape the
     // sibling port's AT daemon already proves on this modem family.
     let response = match serde_json::from_str::<Request>(line.trim()) {
-        Ok(request) => dispatch(ctx, log, rt, mark, &request),
+        Ok(request) => dispatch(ctx, log, inbox, rt, mark, &request),
         Err(e) => Response::error(format!("invalid request: {e}")),
     };
 
@@ -361,6 +500,7 @@ fn handle(
 fn dispatch(
     ctx: &mut Context,
     log: &UrcLog,
+    inbox: &MessageInbox,
     rt: &mut Runtime,
     mark: u64,
     request: &Request,
@@ -378,7 +518,7 @@ fn dispatch(
             ok: true,
             action: "state".into(),
             status: "pass".into(),
-            state: Some(state_of(ctx, log, rt)),
+            state: Some(state_of(ctx, log, inbox, rt)),
             ..Default::default()
         },
         "urc" => Response {
@@ -388,7 +528,14 @@ fn dispatch(
             urcs: log.last(request.limit.unwrap_or(DEFAULT_EVENT_TAIL).min(KEEP_URCS)),
             ..Default::default()
         },
-        other => Response::error(format!("unknown action {other:?} (run|state|urc)")),
+        "messages" => Response {
+            ok: true,
+            action: "messages".into(),
+            status: "pass".into(),
+            messages: inbox.messages(request.limit.unwrap_or(KEEP_MESSAGES)),
+            ..Default::default()
+        },
+        other => Response::error(format!("unknown action {other:?} (run|state|urc|messages)")),
     }
 }
 
@@ -454,7 +601,7 @@ fn run_capability(ctx: &mut Context, log: &UrcLog, mark: u64, request: &Request)
     }
 }
 
-fn state_of(ctx: &Context, log: &UrcLog, rt: &Runtime) -> State {
+fn state_of(ctx: &Context, log: &UrcLog, inbox: &MessageInbox, rt: &Runtime) -> State {
     let mut channels = BTreeMap::new();
     for name in ["cmd", "urc"] {
         if let Some(channel) = ctx.channel(name) {
@@ -476,6 +623,11 @@ fn state_of(ctx: &Context, log: &UrcLog, rt: &Runtime) -> State {
         urc_lines: lines,
         urc_decoded: decoded,
         urc_undecoded: lines.saturating_sub(decoded),
+        text_mode: inbox.text_mode.load(Ordering::SeqCst),
+        messages_announced: inbox.announced.load(Ordering::SeqCst),
+        messages_read: inbox.reads.load(Ordering::SeqCst),
+        message_read_failures: inbox.read_failures.load(Ordering::SeqCst),
+        messages_kept: inbox.messages(usize::MAX).len(),
         events: log.last(DEFAULT_EVENT_TAIL),
     }
 }
@@ -486,7 +638,8 @@ fn state_of(ctx: &Context, log: &UrcLog, rt: &Runtime) -> State {
 ///
 /// `capability` is a capability name — in which case this is the same command a
 /// direct run would be, except that the daemon owns the channel instead of this
-/// process — or one of the two daemon questions, `state` and `urc`.
+/// process — or one of the daemon's own questions, `state`, `urc` and
+/// `messages`.
 ///
 /// Exit codes follow the README's convention: the capability's own `0`/`1`, `2`
 /// for a request the daemon rejected, and `3` when there is no daemon to ask,
@@ -496,6 +649,10 @@ pub fn client(socket: &Path, capability: &str, args: &[String]) -> Result<i32> {
         "state" => serde_json::json!({ "action": "state" }),
         "urc" => serde_json::json!({
             "action": "urc",
+            "limit": flag_value(args, "--limit").and_then(|v| v.parse::<usize>().ok()),
+        }),
+        "messages" => serde_json::json!({
+            "action": "messages",
             "limit": flag_value(args, "--limit").and_then(|v| v.parse::<usize>().ok()),
         }),
         other => serde_json::json!({ "action": "run", "capability": other, "args": args }),
@@ -536,6 +693,26 @@ pub fn client(socket: &Path, capability: &str, args: &[String]) -> Result<i32> {
         let urc = event.get("urc").cloned().unwrap_or_default();
         println!("{at}  {urc}");
     }
+    for message in arr(&response, "messages") {
+        let field = |key: &str| {
+            message
+                .get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        println!(
+            "{}  ({}, {} index {}, {})",
+            field("from"),
+            field("status"),
+            field("storage"),
+            message.get("index").and_then(|v| v.as_u64()).unwrap_or(0),
+            field("timestamp")
+        );
+        for line in field("text").lines() {
+            println!("  {line}");
+        }
+    }
     for line in arr(&response, "output") {
         println!("{}", line.as_str().unwrap_or_default());
     }
@@ -544,7 +721,7 @@ pub fn client(socket: &Path, capability: &str, args: &[String]) -> Result<i32> {
     }
     // A run prints its status the way a direct run does; a query has nothing to
     // pass or fail.
-    if !matches!(capability, "state" | "urc") {
+    if !matches!(capability, "state" | "urc" | "messages") {
         if let Some(status) = response.get("status").and_then(|v| v.as_str()) {
             println!("status: {status}");
         }
@@ -624,6 +801,53 @@ mod tests {
             &kept[0].urc,
             urc::Urc::NewMessage { index, .. } if *index == 10
         ));
+    }
+
+    /// The MT path's contract: the same slot announced twice before it has
+    /// been read is one read, and a read message is kept for the client.
+    #[test]
+    fn the_inbox_deduplicates_announcements_and_keeps_what_was_read() {
+        let inbox = MessageInbox::default();
+        inbox.announced("SM", 7);
+        inbox.announced("SM", 7); // the modem may repeat itself
+        inbox.announced("SM", 8);
+        assert_eq!(inbox.drain().len(), 2);
+        assert_eq!(inbox.drain(), Vec::new());
+
+        inbox.deliver(TextMessage {
+            storage: "SM".into(),
+            index: 7,
+            status: "REC UNREAD".into(),
+            from: "+8613800138000".into(),
+            timestamp: "26/09/20,10:00:00+32".into(),
+            text: "hello".into(),
+        });
+        let messages = inbox.messages(10);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].storage, "SM");
+        assert_eq!(messages[0].text, "hello");
+    }
+
+    #[test]
+    fn the_inbox_ring_is_bounded_and_keeps_the_newest() {
+        let inbox = MessageInbox::default();
+        for i in 0..(KEEP_MESSAGES + 5) {
+            inbox.deliver(TextMessage {
+                storage: "SM".into(),
+                index: i as u32,
+                status: "REC READ".into(),
+                from: String::new(),
+                timestamp: String::new(),
+                text: format!("message {i}"),
+            });
+        }
+        let kept = inbox.messages(usize::MAX);
+        assert_eq!(kept.len(), KEEP_MESSAGES);
+        assert_eq!(kept[0].text, "message 5");
+        assert_eq!(
+            kept.last().unwrap().text,
+            format!("message {}", KEEP_MESSAGES + 4)
+        );
     }
 
     #[test]
