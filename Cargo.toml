@@ -1,0 +1,27 @@
+[package]
+name = "unisoc-cpd"
+version = "0.1.0"
+edition = "2021"
+description = "Device-independent control daemon for the Unisoc CP (baseband)"
+license = "MIT"
+default-run = "unisoc-cpd"
+
+[[bin]]
+name = "unisoc-cpd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.8"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

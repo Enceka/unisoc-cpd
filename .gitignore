@@ -1,0 +1,8 @@
+# Rust build tree.
+/target/
+
+# Run summaries: they are measurements of one device at one moment, not source.
+/runs/
+
+# An aarch64 binary copied back by tools/build-aarch64.sh --on-device.
+/unisoc-cpd.aarch64
