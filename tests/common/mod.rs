@@ -227,6 +227,19 @@ fn respond(w: &mut File, cmd: &str, urcs: &AtomicU64, state: &mut ModemState) {
         "OK\r\n".into()
     } else if upper.starts_with("AT+CMGF") {
         "OK\r\n".into()
+    } else if upper.starts_with("AT+CSCS=") || upper.starts_with("AT+CNMI=") {
+        // The daemon's text-mode surface configuration.
+        "OK\r\n".into()
+    } else if upper.starts_with("AT+CSMS?") {
+        "+CSMS: 0,1,1,1\r\nOK\r\n".into()
+    } else if upper.starts_with("AT+CPMS?") {
+        "+CPMS: \"SM\",3,50,\"SM\",3,50,\"SM\",3,50\r\nOK\r\n".into()
+    } else if upper.starts_with("AT+CSCA?") {
+        "+CSCA: \"+8613800755500\",145\r\nOK\r\n".into()
+    } else if upper.starts_with("AT+CSCS?") {
+        "+CSCS: \"GSM\"\r\nOK\r\n".into()
+    } else if upper.starts_with("AT+CNMI?") {
+        "+CNMI: 0,0,0,0,0\r\nOK\r\n".into()
     } else if upper.starts_with("AT+CMGR=") {
         // A text-mode message whose body names the index it was asked for, so
         // a test can prove the daemon read the slot the +CMTI announced.

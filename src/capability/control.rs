@@ -384,6 +384,45 @@ impl Capability for Sms {
         ok = mode.ok();
 
         match action {
+            // The SMS service surface, read-only: which service is selected,
+            // which storages exist, and the service-centre address the MO path
+            // will use.  A `+CMS ERROR: 302` on send is usually decided by one
+            // of these, not by the send itself.
+            "status" => {
+                let mut ok = true;
+                for cmd in ["AT+CMGF?", "AT+CSMS?", "AT+CPMS?", "AT+CSCA?", "AT+CSCS?", "AT+CNMI?"] {
+                    let r = session.command(cmd, Duration::from_secs(8), &[], 0);
+                    emit(&mut out, cmd, &r);
+                    ok &= r.ok();
+                }
+                return Ok(outcome(out, ok));
+            }
+            // Re-set the service-centre address.  Measured on the device: the
+            // RIL leaves the SMSC written under `CSCS="HEX"`, so after the
+            // daemon moves the character set to GSM the stored value reads
+            // back as hex-of-ASCII and a send answers `+CMS ERROR: 313`.  The
+            // owner re-arms it in the charset the daemon now speaks.
+            "csca" => {
+                let Some(number) = pos.get(1) else {
+                    anyhow::bail!(
+                        "sms csca needs the service-centre address, e.g. +8613800755500"
+                    );
+                };
+                let cmd = format!("AT+CSCA=\"{number}\"");
+                let r = session.command(&cmd, Duration::from_secs(15), &[], 0);
+                emit(&mut out, &cmd, &r);
+                let after = session.command("AT+CSCA?", Duration::from_secs(8), &[], 0);
+                emit(&mut out, "AT+CSCA?", &after);
+                let read_back = after.first_with_prefix("+CSCA:").unwrap_or("");
+                // The readback must now name the number itself, not a hex
+                // rendering of it: a write that did not take must not look
+                // like one.
+                let ok = r.ok() && read_back.contains(number.as_str());
+                if !ok {
+                    ctx.note(format!("CSCA readback does not name {number}: {read_back}"));
+                }
+                return Ok(outcome(out, ok));
+            }
             "list" => {
                 let r = session.command("AT+CMGL=\"ALL\"", Duration::from_secs(30), &[], 0);
                 emit(&mut out, "AT+CMGL=\"ALL\"", &r);
@@ -415,18 +454,52 @@ impl Capability for Sms {
                 let (Some(number), Some(text)) = (pos.get(1), pos.get(2)) else {
                     anyhow::bail!("sms send needs <number> <text>");
                 };
-                let cmd = format!("AT+CMGS=\"{number}\"");
-                let r = session.command_prompted(
-                    &cmd,
-                    Duration::from_secs(15),
-                    text,
-                    Duration::from_secs(120),
-                );
-                emit(&mut out, &format!("{cmd} <text>"), &r);
-                ok &= r.ok() && r.line_with("+CMGS:").is_some();
+                // The submit goes out in PDU mode, on purpose: this CP's
+                // text-mode submit answers `+CMS ERROR: 313` against a SIM
+                // that receives fine (measured, 2026-09-20), text mode cannot
+                // carry 中文 under a GSM charset, and PDU is what the vendor
+                // RIL does.  Text mode is restored afterwards, because the
+                // resident owner's MT reader depends on it.
+                let pdu_mode = session.command("AT+CMGF=0", Duration::from_secs(10), &[], 0);
+                emit(&mut out, "AT+CMGF=0", &pdu_mode);
+                ok &= pdu_mode.ok();
+
+                // The CP refuses a submit whose service-centre field is empty
+                // (measured: `+CMS ERROR: 302`), so the SMSC is read and named
+                // explicitly.
+                let smsc = session
+                    .command("AT+CSCA?", Duration::from_secs(8), &[], 0)
+                    .first_with_prefix("+CSCA:")
+                    .and_then(smsc_from_answer);
+                match crate::pdu::encode_submit(smsc.as_deref(), number, text) {
+                    Ok((hex, octets)) => {
+                        // The full PDU goes into the output: it is the oracle
+                        // difference against Android, and it is how "the
+                        // number was never submitted" gets disproved.
+                        out.push(format!("pdu({octets}): {hex}"));
+                        let cmd = format!("AT+CMGS={octets}");
+                        let r = session.command_prompted(
+                            &cmd,
+                            Duration::from_secs(15),
+                            &hex,
+                            Duration::from_secs(120),
+                        );
+                        emit(&mut out, &format!("{cmd} <pdu>"), &r);
+                        ok &= r.ok() && r.line_with("+CMGS:").is_some();
+                    }
+                    Err(e) => {
+                        ctx.note(format!("the message was never submitted: {e}"));
+                        out.push(format!("not submitted: {e}"));
+                        ok = false;
+                    }
+                }
+
+                let restore = session.command("AT+CMGF=1", Duration::from_secs(10), &[], 0);
+                emit(&mut out, "AT+CMGF=1", &restore);
+                ok &= restore.ok();
             }
             other => anyhow::bail!(
-                "sms: unknown action {other:?} (list|read <i>|delete <i|all>|send <num> <text>)"
+                "sms: unknown action {other:?} (status|list|read <i>|delete <i|all>|send <num> <text>)"
             ),
         }
         Ok(outcome(out, ok))
@@ -482,6 +555,54 @@ fn split_fields(body: &str) -> Vec<String> {
 /// than hand back hex dressed up as a text.
 const CMGR_TEXT_STATUSES: &[&str] = &["REC UNREAD", "REC READ", "STO UNSENT", "STO SENT", "ALL"];
 
+/// A body the modem could not convert into the TE character set arrives as
+/// UCS2 hex: `"6D4B8BD5"` *is* "测试".  Measured on the device with
+/// `CSCS="GSM"` — the address fields come through as text, a Chinese body
+/// comes through as hex.
+///
+/// The trade is explicit: a GSM-7 body that literally *is* hex-looking text
+/// decodes wrongly.  On this network a Chinese message is far more likely than
+/// a message that spells hex, so the modem's UCS2 rendering wins.
+fn decode_ucs2_hex(body: &str) -> String {
+    let t = body.trim();
+    if t.len() < 4 || t.len() % 4 != 0 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return body.to_string();
+    }
+    let units: Vec<u16> = (0..t.len())
+        .step_by(4)
+        .filter_map(|i| u16::from_str_radix(&t[i..i + 4], 16).ok())
+        .collect();
+    if units.len() * 4 != t.len() {
+        return body.to_string();
+    }
+    String::from_utf16(&units).unwrap_or_else(|_| body.to_string())
+}
+
+/// `+CSCA: "<number>",<toa>` — the number, decoded when the modem stored it
+/// as hex-of-ASCII.  Measured on the device: the RIL writes the SMSC under
+/// `CSCS="HEX"`, which makes the readback read `2B3836…` for `+8613800755000`.
+fn smsc_from_answer(line: &str) -> Option<String> {
+    let field = line.split_once(':')?.1.trim();
+    let value = field.split(',').next()?.trim().trim_matches('"');
+    if value.is_empty() {
+        return None;
+    }
+    if value.starts_with('+') || value.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(value.to_string());
+    }
+    if value.len() % 2 == 0 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let decoded: String = (0..value.len())
+            .step_by(2)
+            .filter_map(|i| u8::from_str_radix(&value[i..i + 2], 16).ok())
+            .map(|b| b as char)
+            .collect();
+        if decoded.starts_with('+') || decoded.bytes().all(|b| b.is_ascii_digit()) {
+            return Some(decoded);
+        }
+    }
+    None
+}
+
 /// Parse the reply lines of `AT+CMGR=<index>` in text mode: a `+CMGR:` header
 /// of comma-separated quoted fields, then the body up to the final result
 /// code, which the caller's `lines` already excludes (`Reply.lines`).
@@ -497,12 +618,14 @@ pub fn parse_cmgr(index: u32, lines: &[String]) -> Option<TextMessage> {
         return None;
     }
 
-    let text = lines
-        .iter()
-        .filter(|l| !l.starts_with("+CMGR:"))
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = decode_ucs2_hex(
+        &lines
+            .iter()
+            .filter(|l| !l.starts_with("+CMGR:"))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
 
     Some(TextMessage {
         storage: String::new(),
@@ -686,6 +809,41 @@ mod tests {
         assert_eq!(message.from, "10086");
         assert_eq!(message.timestamp, "26/09/20,10:00:00+32");
         assert_eq!(message.text, "line one\nline two");
+    }
+
+    /// The measured CSCA readback of this unit: the RIL stored the SMSC under
+    /// `CSCS="HEX"`, so the GSM readback is hex-of-ASCII.  The send path has
+    /// to name the number, not the hex rendering of it.
+    #[test]
+    fn the_smsc_is_decoded_out_of_the_hex_rendering() {
+        let line = "+CSCA: \"2B38363133383030373535353030\",145";
+        assert_eq!(smsc_from_answer(line).as_deref(), Some("+8613800755500"));
+        assert_eq!(
+            smsc_from_answer("+CSCA: \"+8613800755500\",145").as_deref(),
+            Some("+8613800755500")
+        );
+        assert_eq!(smsc_from_answer("+CSCA: \"\",129"), None);
+    }
+
+    #[test]
+    fn a_chinese_body_arriving_as_ucs2_hex_is_decoded() {
+        // Measured on the device: "测试" arrives as `6D4B8BD5` under
+        // `CSCS="GSM"`, because the modem cannot convert it.
+        let lines = vec![
+            "+CMGR: \"REC READ\",\"+8613000000000\",,\"26/09/20,12:50:08+32\"".to_string(),
+            "6D4B8BD5".to_string(),
+        ];
+        let message = parse_cmgr(1, &lines).unwrap();
+        assert_eq!(message.text, "测试");
+    }
+
+    #[test]
+    fn a_text_body_stays_text() {
+        let lines = vec![
+            "+CMGR: \"REC READ\",\"+8613000000000\",,\"26/09/20,12:50:08+32\"".to_string(),
+            "hello from index 7".to_string(),
+        ];
+        assert_eq!(parse_cmgr(7, &lines).unwrap().text, "hello from index 7");
     }
 
     #[test]

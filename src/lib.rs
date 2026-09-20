@@ -11,6 +11,7 @@ pub mod channel;
 pub mod cli;
 pub mod context;
 pub mod identity;
+pub mod pdu;
 pub mod probes;
 pub mod profile;
 pub mod profile_check;

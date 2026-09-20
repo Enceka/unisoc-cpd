@@ -96,12 +96,24 @@ fn serve(ctx: &mut Context, socket: &Path, seconds: f64) -> Result<Outcome> {
     // hands back PDU hex, which this daemon does not decode and will not
     // pretend to.
     let default_timeout = Duration::from_secs_f64(ctx.profile.at.default_timeout.max(1.0));
-    let text_mode = session.command("AT+CMGF=1", default_timeout, &[], 0).ok();
-    inbox.text_mode.store(text_mode, Ordering::SeqCst);
-    if !text_mode {
+    let surface = configure_sms_surface(&session, default_timeout);
+    inbox.text_mode.store(surface.text_mode, Ordering::SeqCst);
+    inbox
+        .charset_gsm
+        .store(surface.charset_gsm, Ordering::SeqCst);
+    inbox
+        .mt_indication
+        .store(surface.mt_indication, Ordering::SeqCst);
+    if !surface.text_mode {
         eprintln!(
             "unisoc-cpd: AT+CMGF=1 was not accepted; incoming messages are \
              announced but not read"
+        );
+    }
+    if !surface.mt_indication {
+        eprintln!(
+            "unisoc-cpd: +CMTI could not be enabled; new messages will sit in \
+             storage unannounced"
         );
     }
 
@@ -313,6 +325,29 @@ impl UrcLog {
 
 // ------------------------------------------------------------- the MT half
 
+/// The text-mode surface the daemon needs before a `+CMTI:` means anything.
+#[derive(Debug, Default)]
+struct SmsSurface {
+    /// `AT+CMGF=1` accepted: `CMGR` answers text, not PDU.
+    text_mode: bool,
+    /// `AT+CSCS="GSM"` accepted.  Measured on the device: the RIL leaves the
+    /// TE character set at `HEX`, under which `CMGS="<number>"` is not a phone
+    /// number at all and the send answers `+CMS ERROR: 302`.
+    charset_gsm: bool,
+    /// `AT+CNMI=2,1,0,0,0` accepted: a new message becomes a `+CMTI` on the
+    /// unsolicited stream.  Without it the message lands in storage silently
+    /// and the MT path never starts.
+    mt_indication: bool,
+}
+
+fn configure_sms_surface(session: &crate::at::AtSession, timeout: Duration) -> SmsSurface {
+    SmsSurface {
+        text_mode: session.command("AT+CMGF=1", timeout, &[], 0).ok(),
+        charset_gsm: session.command("AT+CSCS=\"GSM\"", timeout, &[], 0).ok(),
+        mt_indication: session.command("AT+CNMI=2,1,0,0,0", timeout, &[], 0).ok(),
+    }
+}
+
 /// Messages the modem has announced, and the ones we have read.
 ///
 /// The announcement and the read are deliberately two steps: a `+CMTI:` can
@@ -324,6 +359,10 @@ struct MessageInbox {
     /// `+CMTI:` readable, and its absence is reported rather than worked
     /// around (PDU is not decoded here).
     text_mode: AtomicBool,
+    /// Whether the daemon got the TE character set onto GSM (`AT+CSCS="GSM"`).
+    charset_gsm: AtomicBool,
+    /// Whether `+CMTI` indications were enabled (`AT+CNMI=2,1,0,0,0`).
+    mt_indication: AtomicBool,
     /// How many `+CMTI:` this daemon has seen.
     announced: AtomicU64,
     /// How many `AT+CMGR` reads it has made for them.
@@ -431,6 +470,10 @@ struct State {
     /// Text mode is what makes a `+CMTI:` readable; its absence is reported,
     /// never silently worked around.
     text_mode: bool,
+    /// The TE character set the daemon left the modem on.
+    charset_gsm: bool,
+    /// Whether new messages are announced at all.
+    mt_indication: bool,
     /// Announcements seen / reads made / reads that were not a text message.
     messages_announced: u64,
     messages_read: u64,
@@ -624,6 +667,8 @@ fn state_of(ctx: &Context, log: &UrcLog, inbox: &MessageInbox, rt: &Runtime) -> 
         urc_decoded: decoded,
         urc_undecoded: lines.saturating_sub(decoded),
         text_mode: inbox.text_mode.load(Ordering::SeqCst),
+        charset_gsm: inbox.charset_gsm.load(Ordering::SeqCst),
+        mt_indication: inbox.mt_indication.load(Ordering::SeqCst),
         messages_announced: inbox.announced.load(Ordering::SeqCst),
         messages_read: inbox.reads.load(Ordering::SeqCst),
         message_read_failures: inbox.read_failures.load(Ordering::SeqCst),
