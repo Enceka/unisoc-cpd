@@ -6,3 +6,4 @@
 
 # An aarch64 binary copied back by tools/build-aarch64.sh --on-device.
 /unisoc-cpd.aarch64
+.DS_Store

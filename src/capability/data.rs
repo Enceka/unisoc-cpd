@@ -102,6 +102,121 @@ pub fn apn_from_source(path: &str) -> Option<String> {
     None
 }
 
+/// The APN a SIM's home operator is known by, keyed by MCC-MNC.  This is the
+/// fallback *behind* the modem's own context and the config file: a bearer
+/// resolves its APN in the order argument > /etc/e5/mobile-data.conf >
+/// AT+CGDCONT? (what Android or the factory left configured) > this table >
+/// nothing.  Extend it as new cards turn up; an unknown IMSI is reported, not
+/// guessed.
+const APN_BY_MCCMNC: &[(&str, &str)] = &[
+    // China
+    ("46000", "cmnet"),
+    ("46002", "cmnet"),
+    ("46004", "cmnet"),
+    ("46007", "cmnet"),
+    ("46008", "cmnet"),
+    ("46001", "3gnet"),
+    ("46006", "3gnet"),
+    ("46009", "3gnet"),
+    ("46003", "ctlte"),
+    ("46011", "ctlte"),
+    ("46015", "cbnet"),
+    // Hong Kong, Taiwan, and a few common roaming partners
+    ("45400", "mobile"),
+    ("45403", "three.com.hk"),
+    ("45406", "smartone"),
+    ("46692", "internet"),
+    ("46697", "internet"),
+    ("26201", "internet"),
+    ("26202", "internet"),
+    ("23410", "internet"),
+    ("310260", "epc.tmobile.com"),
+    ("310410", "nxtgenphone"),
+];
+
+/// The APN of one context out of an AT+CGDCONT? reply: the third field, quoted.
+/// An empty one means the context exists but names no APN.
+pub fn cgdcont_apn(reply: &crate::at::Reply, cid: u32) -> Option<String> {
+    for line in &reply.lines {
+        let body = match line.trim().strip_prefix("+CGDCONT:") {
+            Some(b) => b.trim(),
+            None => continue,
+        };
+        let mut it = body.split(',');
+        let got: u32 = it.next()?.trim().parse().ok()?;
+        if got != cid {
+            continue;
+        }
+        let _pdp_type = it.next();
+        let apn = it.next()?.trim().trim_matches('"').to_string();
+        if !apn.is_empty() {
+            return Some(apn);
+        }
+    }
+    None
+}
+
+/// The home operator's APN, from the SIM's IMSI: the first three digits are the
+/// MCC, the rest the MNC (two or three digits, so the longest table key wins).
+pub fn imsi_apn(imsi: &str) -> Option<(String, String)> {
+    let digits: String = imsi.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 5 {
+        return None;
+    }
+    let mcc = &digits[0..3];
+    let mnc = &digits[3..];
+    for len in [3usize, 2] {
+        if mnc.len() < len {
+            continue;
+        }
+        let key = format!("{mcc}{}", &mnc[0..len]);
+        if let Some((_, apn)) = APN_BY_MCCMNC.iter().find(|(k, _)| *k == key) {
+            return Some((key, (*apn).to_string()));
+        }
+    }
+    None
+}
+
+/// Resolve the APN in the order the plan wants: the command line, then the
+/// config file (which is therefore the "allowed to be edited" override), then
+/// what the modem already has configured, then the SIM's operator.  The second
+/// return value names the source so a caller can say where an address came from.
+pub fn resolve_apn(
+    session: &crate::at::AtSession,
+    cid: u32,
+    arg: Option<String>,
+    source_path: Option<&str>,
+) -> (Option<String>, String) {
+    if let Some(a) = arg {
+        let a = a.trim().to_string();
+        if !a.is_empty() {
+            return (Some(a), "argument".to_string());
+        }
+    }
+    if let Some(p) = source_path {
+        if let Some(a) = apn_from_source(p) {
+            return (Some(a), format!("config {p}"));
+        }
+    }
+    let cgd = session.command("AT+CGDCONT?", Duration::from_secs(8), &[], 0);
+    if let Some(a) = cgdcont_apn(&cgd, cid) {
+        return (Some(a), format!("modem +CGDCONT? cid {cid}"));
+    }
+    let cimi = session.command("AT+CIMI", Duration::from_secs(8), &[], 0);
+    let imsi = cimi
+        .lines
+        .iter()
+        .map(|l| l.trim())
+        .find(|l| l.len() >= 5 && l.chars().all(|c| c.is_ascii_digit()));
+    if let Some(imsi) = imsi {
+        match imsi_apn(imsi) {
+            Some((key, apn)) => return (Some(apn), format!("imsi {key}")),
+            None => return (None, format!("imsi {imsi} is not in the APN table")),
+        }
+    }
+    (None, "no source".to_string())
+}
+
 impl Capability for Data {
     fn name(&self) -> &'static str {
         "data"
@@ -139,33 +254,45 @@ impl Capability for Data {
                 Ok(Outcome::pass(out))
             }
             "apn" => {
+                // Reports what a bearer would use *and* where it came from, so
+                // "it picked the wrong APN" is answerable without a packet
+                // capture: argument > config file > modem's own context > SIM.
+                let session = ctx.at()?;
+                let (apn, source) = resolve_apn(
+                    &session,
+                    cid,
+                    pos.get(1).cloned(),
+                    ctx.profile.data.apn_source.as_deref(),
+                );
                 let mut out = Vec::new();
-                match &ctx.profile.data.apn_source {
-                    Some(p) => match apn_from_source(p) {
-                        Some(apn) => out.push(format!("APN from {p}: {apn}")),
-                        None => out.push(format!("no APN= line in {p}")),
-                    },
-                    None => out.push("this profile has no apn_source".to_string()),
+                match apn {
+                    Some(a) => out.push(format!("APN {a} (source: {source})")),
+                    None => out.push(format!("no APN found ({source})")),
                 }
                 Ok(Outcome::pass(out))
             }
             "up" => {
-                let apn = pos.get(1).cloned().or_else(|| {
-                    ctx.profile
-                        .data
-                        .apn_source
-                        .as_deref()
-                        .and_then(apn_from_source)
-                });
                 let session = ctx.at()?;
+                let (apn, source) = resolve_apn(
+                    &session,
+                    cid,
+                    pos.get(1).cloned(),
+                    ctx.profile.data.apn_source.as_deref(),
+                );
                 let mut out = Vec::new();
 
-                if let Some(apn) = &apn {
-                    let cmd = format!("AT+CGDCONT={cid},\"IPV4V6\",\"{apn}\"");
-                    let r = session.command(&cmd, Duration::from_secs(15), &[], 0);
-                    emit(&mut out, &cmd, &r);
-                } else {
-                    out.push("! no APN given and none in the profile's apn_source".into());
+                match &apn {
+                    // The modem's own context is already what it would be told.
+                    Some(a) if source.starts_with("modem") => {
+                        out.push(format!("apn {a} (source: {source}, already configured)"));
+                    }
+                    Some(a) => {
+                        let cmd = format!("AT+CGDCONT={cid},\"IPV4V6\",\"{a}\"");
+                        let r = session.command(&cmd, Duration::from_secs(15), &[], 0);
+                        emit(&mut out, &cmd, &r);
+                        out.push(format!("apn {a} (source: {source})"));
+                    }
+                    None => out.push(format!("! no APN found ({source})")),
                 }
 
                 let active = session.command("AT+CGACT?", Duration::from_secs(8), &[], 0);
