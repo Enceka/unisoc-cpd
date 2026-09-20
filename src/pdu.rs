@@ -98,7 +98,13 @@ pub fn encode_submit(smsc: Option<&str>, destination: &str, text: &str) -> Resul
     }
 
     let mut tpdu: Vec<u8> = Vec::new();
-    tpdu.push(0x11); // SMS-SUBMIT, no validity period, no status report
+    // SMS-SUBMIT, no validity period, no status report.  The first octet is
+    // 0x01 and NOT 0x11: VPF=00 means the TP-VP field is absent, and 0x11
+    // (VPF=relative) promises an octet this encoder does not carry -- the CP
+    // then reads the whole PDU one field off and refuses it.  Measured against
+    // the vendor stack's own submit (radio log `AT> 0001000B…`), which uses
+    // exactly this octet.
+    tpdu.push(0x01);
     tpdu.push(0x00); // TP-MR: the CP numbers the message itself
     tpdu.extend(address_field(destination));
     tpdu.push(0x00); // TP-PID: short message
@@ -149,7 +155,7 @@ mod tests {
         let (hex, octets) = encode_submit(None, "13000000000", "test2").unwrap();
         assert_eq!(
             hex,
-            "0011000B813100000000F000080A\
+            "0001000B813100000000F000080A\
              00740065007300740032"
         );
         // Everything after the one-octet (empty) service-centre field.
