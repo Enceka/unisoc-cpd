@@ -50,6 +50,12 @@ pub struct Context {
     pub profile: Profile,
     pub mode: Mode,
     pub runs_dir: PathBuf,
+    /// Where the channel locks live, and where a resident owner puts its socket
+    /// (`capability::serve`).  One directory for both, because both answer the
+    /// same question: who owns this channel, and what is it doing.
+    pub state_dir: PathBuf,
+    /// Whether a run writes its summary; `--no-telemetry` turns it off.
+    pub telemetry: bool,
     pub verbose: bool,
     pub argv: Vec<String>,
     pub events: Vec<Event>,
@@ -60,32 +66,46 @@ pub struct Context {
     baseline: Baseline,
 }
 
+fn now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// Sample every counter the summary is a delta of.
+///
+/// Everything degrades to `None` when the platform has no such counter, so the
+/// summary says "not measured" rather than "zero" (profile-driven probes).
+fn sample_baseline(profile: &Profile) -> Baseline {
+    Baseline {
+        mailbox_irq: probes::mailbox_irq_count(&profile.mailbox.irq_match).map(|v| v as i64),
+        cp_asserts: probes::kernel_log_matches(&profile.telemetry.assert_pattern).map(|v| v as i64),
+        net: profile
+            .data
+            .interface(None)
+            .as_deref()
+            .and_then(probes::net_counters),
+    }
+}
+
 impl Context {
     pub fn new(
         profile: Profile,
         mode: Mode,
         runs_dir: PathBuf,
-        lock_dir: PathBuf,
+        state_dir: PathBuf,
         verbose: bool,
         argv: Vec<String>,
     ) -> Self {
-        let baseline = Baseline {
-            mailbox_irq: probes::mailbox_irq_count(&profile.mailbox.irq_match).map(|v| v as i64),
-            cp_asserts: probes::kernel_log_matches(&profile.telemetry.assert_pattern)
-                .map(|v| v as i64),
-            net: profile
-                .data
-                .interface(None)
-                .as_deref()
-                .and_then(probes::net_counters),
-        };
+        let baseline = sample_baseline(&profile);
         let mut channels = BTreeMap::new();
         channels.insert(
             "cmd".to_string(),
             Arc::new(SerialChannel::new(
                 profile.channels.cmd.clone(),
                 "cmd",
-                lock_dir.clone(),
+                state_dir.clone(),
                 Duration::from_secs_f64(profile.at.reopen_backoff.max(0.0)),
                 true,
             )),
@@ -96,7 +116,7 @@ impl Context {
                 Arc::new(SerialChannel::new(
                     urc.clone(),
                     "urc",
-                    lock_dir.clone(),
+                    state_dir.clone(),
                     Duration::from_secs_f64(profile.at.reopen_backoff.max(0.0)),
                     true,
                 )),
@@ -106,18 +126,31 @@ impl Context {
             profile,
             mode,
             runs_dir,
+            state_dir,
+            telemetry: true,
             verbose,
             argv,
             events: Vec::new(),
             notes: Vec::new(),
             channels,
             session: None,
-            started_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0),
+            started_at: now_secs(),
             baseline,
         }
+    }
+
+    /// Start a fresh diagnostic scope.
+    ///
+    /// One `Context` normally serves one capability, so the notes, events and
+    /// counter baselines it collected *are* the run.  A resident owner
+    /// (`serve`) answers many capabilities from one `Context`, and for it they
+    /// have to be re-taken per request — otherwise every summary after the
+    /// first would describe the previous run.
+    pub fn begin_run(&mut self) {
+        self.events.clear();
+        self.notes.clear();
+        self.started_at = now_secs();
+        self.baseline = sample_baseline(&self.profile);
     }
 
     /// Open the AT channels and return the session.  Idempotent.
@@ -129,7 +162,8 @@ impl Context {
             return Ok(Arc::clone(s));
         }
         for (name, ch) in &self.channels {
-            ch.open().with_context(|| format!("opening {name} channel"))?;
+            ch.open()
+                .with_context(|| format!("opening {name} channel"))?;
         }
         let cmd = Arc::clone(self.channels.get("cmd").expect("cmd channel"));
         let urc = self.channels.get("urc").cloned();
@@ -163,27 +197,28 @@ impl Context {
 
     /// Sample everything after the run and build the summary.
     pub fn finish(&self, capability: &str, status: &str, exit_code: i32) -> RunSummary {
-        let ended = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
+        let ended = now_secs();
 
         let mut channels: BTreeMap<String, ChannelMetrics> = BTreeMap::new();
         for (name, ch) in &self.channels {
             channels.insert(name.clone(), ch.metrics());
         }
 
-        let at = self.session.as_ref().map(|s| s.metrics()).unwrap_or_default();
+        let at = self
+            .session
+            .as_ref()
+            .map(|s| s.metrics())
+            .unwrap_or_default();
         let urc_tail = self
             .session
             .as_ref()
             .map(|s| s.urc_tail(20))
             .unwrap_or_default();
 
-        let mailbox_after = probes::mailbox_irq_count(&self.profile.mailbox.irq_match)
-            .map(|v| v as i64);
-        let asserts_after = probes::kernel_log_matches(&self.profile.telemetry.assert_pattern)
-            .map(|v| v as i64);
+        let mailbox_after =
+            probes::mailbox_irq_count(&self.profile.mailbox.irq_match).map(|v| v as i64);
+        let asserts_after =
+            probes::kernel_log_matches(&self.profile.telemetry.assert_pattern).map(|v| v as i64);
         let net_after = self
             .profile
             .data
@@ -213,8 +248,16 @@ impl Context {
             at,
             channels,
             urc: UrcStats {
-                lines: self.session.as_ref().map(|s| s.metrics().urc_lines).unwrap_or(0),
-                max_gap_s: self.session.as_ref().map(|s| s.metrics().max_urc_gap_s).unwrap_or(0.0),
+                lines: self
+                    .session
+                    .as_ref()
+                    .map(|s| s.metrics().urc_lines)
+                    .unwrap_or(0),
+                max_gap_s: self
+                    .session
+                    .as_ref()
+                    .map(|s| s.metrics().max_urc_gap_s)
+                    .unwrap_or(0.0),
                 gaps_over_threshold: self
                     .session
                     .as_ref()
@@ -222,8 +265,14 @@ impl Context {
                     .unwrap_or(0),
                 tail: urc_tail,
             },
-            mailbox_irq: Some(CounterDelta::between(self.baseline.mailbox_irq, mailbox_after)),
-            cp_asserts: Some(CounterDelta::between(self.baseline.cp_asserts, asserts_after)),
+            mailbox_irq: Some(CounterDelta::between(
+                self.baseline.mailbox_irq,
+                mailbox_after,
+            )),
+            cp_asserts: Some(CounterDelta::between(
+                self.baseline.cp_asserts,
+                asserts_after,
+            )),
             net: net_after,
             net_delta,
             events: self.events.clone(),

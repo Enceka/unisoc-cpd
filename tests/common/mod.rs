@@ -53,7 +53,13 @@ impl FakeModem {
     pub fn wait_for_command(&self, needle: &str, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if self.commands.lock().unwrap().iter().any(|c| c.contains(needle)) {
+            if self
+                .commands
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.contains(needle))
+            {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -222,7 +228,8 @@ fn respond(w: &mut File, cmd: &str, urcs: &AtomicU64, state: &mut ModemState) {
     } else if upper.starts_with("AT+CMGF") {
         "OK\r\n".into()
     } else if upper.starts_with("AT+CMGL") {
-        "+CMGL: 1,\"REC READ\",\"+8613800138000\",,\"26/09/20,10:00:00+32\"\r\nhello\r\nOK\r\n".into()
+        "+CMGL: 1,\"REC READ\",\"+8613800138000\",,\"26/09/20,10:00:00+32\"\r\nhello\r\nOK\r\n"
+            .into()
     } else if upper.starts_with("AT+CGACT?") {
         "+CGACT: 1,1\r\nOK\r\n".into()
     } else if upper.starts_with("AT+CGCONTRDP") {
@@ -236,14 +243,27 @@ fn respond(w: &mut File, cmd: &str, urcs: &AtomicU64, state: &mut ModemState) {
     } else if upper.starts_with("AT+CUSD") {
         "+CUSD: 0,\"balance 12.34 CNY\",15\r\nOK\r\n".into()
     } else if upper.starts_with("AT+SPLBAND=1") {
-        state.lte_words = Some(upper.trim_start_matches("AT+SPLBAND=1").trim_start_matches(',').to_string());
+        state.lte_words = Some(
+            upper
+                .trim_start_matches("AT+SPLBAND=1")
+                .trim_start_matches(',')
+                .to_string(),
+        );
         "OK\r\n".into()
     } else if upper.starts_with("AT+SPLBAND=0") {
         // default: bands 1, 3 and 41 (words 49-64, 33-48, 17-32, 1-16, 65-80)
-        let words = state.lte_words.clone().unwrap_or_else(|| "0,256,0,5,0".into());
+        let words = state
+            .lte_words
+            .clone()
+            .unwrap_or_else(|| "0,256,0,5,0".into());
         format!("+SPLBAND: {words}\r\nOK\r\n")
     } else if upper.starts_with("AT+SPLBAND=2") {
-        state.nr_words = Some(upper.trim_start_matches("AT+SPLBAND=2").trim_start_matches(',').to_string());
+        state.nr_words = Some(
+            upper
+                .trim_start_matches("AT+SPLBAND=2")
+                .trim_start_matches(',')
+                .to_string(),
+        );
         "OK\r\n".into()
     } else if upper.starts_with("AT+SPLBAND=3") {
         // default: n1 (value1 bit 0), n78 (value3 bit 8), n80 (super bit 2)

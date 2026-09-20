@@ -46,7 +46,10 @@ fn band_status_decodes_the_locked_bands() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "stdout:\n{stdout}");
     assert!(stdout.contains("locked bands: 1,3,41"), "stdout:\n{stdout}");
-    assert!(stdout.contains("locked bands: 1,78,80"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("locked bands: 1,78,80"),
+        "stdout:\n{stdout}"
+    );
 }
 
 #[test]
@@ -55,7 +58,10 @@ fn band_lock_is_read_back_before_it_is_believed() {
     let out = run(&r.dir, "band", &["lock", "nr", "78"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "stdout:\n{stdout}");
-    assert!(stdout.contains("AT+SPLBAND=2,0,0,256,0"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("AT+SPLBAND=2,0,0,256,0"),
+        "stdout:\n{stdout}"
+    );
     assert!(stdout.contains("locked bands: 78"), "stdout:\n{stdout}");
 
     let out = run(&r.dir, "band", &["lock", "lte", "3", "41"]);
@@ -79,7 +85,10 @@ fn band_unlock_all_clears_both_rats() {
     let out = run(&r.dir, "band", &["unlock", "all"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "stdout:\n{stdout}");
-    assert!(stdout.contains("AT+SPLBAND=1,0,0,0,0,0"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("AT+SPLBAND=1,0,0,0,0,0"),
+        "stdout:\n{stdout}"
+    );
     assert!(stdout.contains("AT+SPLBAND=2,0,0,0,0"), "stdout:\n{stdout}");
 
     // and the read-back now reports nothing locked

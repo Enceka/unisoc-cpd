@@ -11,7 +11,14 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_unisoc-cpd")
 }
 
-fn run_cli(profile: &Path, runs: &Path, state: &Path, mode: &str, capability: &str, extra: &[&str]) -> Output {
+fn run_cli(
+    profile: &Path,
+    runs: &Path,
+    state: &Path,
+    mode: &str,
+    capability: &str,
+    extra: &[&str],
+) -> Output {
     Command::new(bin())
         .arg("--profile")
         .arg(profile)
@@ -34,7 +41,11 @@ fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
             if let Some(found) = find_file(&path, name) {
                 return Some(found);
             }
-        } else if path.file_name().map(|n| n.to_string_lossy() == name).unwrap_or(false) {
+        } else if path
+            .file_name()
+            .map(|n| n.to_string_lossy() == name)
+            .unwrap_or(false)
+        {
             return Some(path);
         }
     }
@@ -69,7 +80,12 @@ fn link_passes_and_writes_a_run_summary() {
     assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(stdout.contains("status: pass"), "stdout:\n{stdout}");
     assert!(
-        modem.commands().iter().filter(|c| c.as_str() == "AT").count() >= 3,
+        modem
+            .commands()
+            .iter()
+            .filter(|c| c.as_str() == "AT")
+            .count()
+            >= 3,
         "the modem did not see the probe cadence: {:?}",
         modem.commands()
     );
@@ -128,7 +144,14 @@ fn sim_reports_the_pin_state() {
     let dir = scratch("cli-sim");
     let profile = write_profile(&dir, &slave, None, "");
 
-    let out = run_cli(&profile, &dir.join("runs"), &dir.join("state"), "native", "sim", &[]);
+    let out = run_cli(
+        &profile,
+        &dir.join("runs"),
+        &dir.join("state"),
+        "native",
+        "sim",
+        &[],
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "stdout:\n{stdout}");
     assert!(stdout.contains("+CPIN: READY"), "stdout:\n{stdout}");
@@ -142,7 +165,14 @@ fn signal_decodes_cesq() {
     let dir = scratch("cli-signal");
     let profile = write_profile(&dir, &slave, None, "");
 
-    let out = run_cli(&profile, &dir.join("runs"), &dir.join("state"), "native", "signal", &[]);
+    let out = run_cli(
+        &profile,
+        &dir.join("runs"),
+        &dir.join("state"),
+        "native",
+        "signal",
+        &[],
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "stdout:\n{stdout}");
     // index 60 -> -80 dBm, index 20 -> -9.5 dB
@@ -210,7 +240,14 @@ fn vendor_mode_runs_the_profiles_command_and_records_it() {
 fn a_native_only_capability_refuses_vendor_mode() {
     let dir = scratch("cli-native-only");
     let profile = write_profile(&dir, Path::new("/dev/null"), None, "");
-    let out = run_cli(&profile, &dir.join("runs"), &dir.join("state"), "vendor", "link", &[]);
+    let out = run_cli(
+        &profile,
+        &dir.join("runs"),
+        &dir.join("state"),
+        "vendor",
+        "link",
+        &[],
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success());
     assert!(stderr.contains("native-only"), "stderr:\n{stderr}");
@@ -232,8 +269,14 @@ fn capabilities_and_profiles_list_from_the_tree() {
     let out = Command::new(bin()).arg("capabilities").output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success());
-    for want in ["link", "sim", "register", "data", "sms", "call", "ussd", "band", "cfu", "imei", "nv", "diag"] {
-        assert!(stdout.contains(want), "capabilities output lacks {want}:\n{stdout}");
+    for want in [
+        "link", "sim", "register", "data", "sms", "call", "ussd", "band", "cfu", "imei", "nv",
+        "diag",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "capabilities output lacks {want}:\n{stdout}"
+        );
     }
 
     // This also proves both shipped profiles parse.

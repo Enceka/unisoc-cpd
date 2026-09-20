@@ -16,5 +16,6 @@ pub mod profile;
 pub mod profile_check;
 pub mod telemetry;
 pub mod unisoc_at;
+pub mod urc;
 
 pub use context::Mode;

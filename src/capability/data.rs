@@ -169,9 +169,7 @@ impl Capability for Data {
                 }
 
                 let active = session.command("AT+CGACT?", Duration::from_secs(8), &[], 0);
-                let already = active
-                    .line_with(&format!("+CGACT:{cid},1"))
-                    .is_some();
+                let already = active.line_with(&format!("+CGACT:{cid},1")).is_some();
                 emit(&mut out, "AT+CGACT?", &active);
                 if !already {
                     let cmd = format!("AT+CGACT=1,{cid}");
@@ -209,10 +207,20 @@ impl Capability for Data {
                         // the sipa driver hands up wrong hardware checksums
                         let _ = run("ethtool", &["-K", iface, "rx", "off"]);
                         let _ = run("ip", &["addr", "flush", "dev", iface]);
-                        let (aok, aerr) = run("ip", &["addr", "add", &format!("{addr}/{prefix}"), "dev", iface]);
-                        out.push(format!("ip addr add {addr}/{prefix} dev {iface}: {aok} {aerr}"));
-                        let (rok, rerr) = run("ip", &["route", "replace", "default", "dev", iface, "metric", "100"]);
-                        out.push(format!("ip route replace default dev {iface}: {rok} {rerr}"));
+                        let (aok, aerr) = run(
+                            "ip",
+                            &["addr", "add", &format!("{addr}/{prefix}"), "dev", iface],
+                        );
+                        out.push(format!(
+                            "ip addr add {addr}/{prefix} dev {iface}: {aok} {aerr}"
+                        ));
+                        let (rok, rerr) = run(
+                            "ip",
+                            &["route", "replace", "default", "dev", iface, "metric", "100"],
+                        );
+                        out.push(format!(
+                            "ip route replace default dev {iface}: {rok} {rerr}"
+                        ));
                         ok &= aok && rok;
                         if !c5.dns.is_empty() {
                             out.push(format!("dns {}", c5.dns.join(" ")));
@@ -230,9 +238,16 @@ impl Capability for Data {
                 }
 
                 if ok {
-                    ctx.event("data", format!("bearer up on {}", iface.clone().unwrap_or_default()));
+                    ctx.event(
+                        "data",
+                        format!("bearer up on {}", iface.clone().unwrap_or_default()),
+                    );
                 }
-                Ok(if ok { Outcome::pass(out) } else { Outcome::fail(out) })
+                Ok(if ok {
+                    Outcome::pass(out)
+                } else {
+                    Outcome::fail(out)
+                })
             }
             "down" => {
                 let session = ctx.at()?;
@@ -282,6 +297,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("mobile-data.conf");
         std::fs::write(&f, "# comment\nAPN=3gnet\nOTHER=1\n").unwrap();
-        assert_eq!(apn_from_source(f.to_str().unwrap()).as_deref(), Some("3gnet"));
+        assert_eq!(
+            apn_from_source(f.to_str().unwrap()).as_deref(),
+            Some("3gnet")
+        );
     }
 }

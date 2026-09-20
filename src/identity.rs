@@ -23,13 +23,18 @@ pub const IMEI_RECORD_MARKER: &[u8] = &[0x74, 0x00, 0x5E, 0x01];
 /// byte-for-byte as captured, and `imei read` treats a reply as data, not as
 /// a promise.
 pub fn nv_read_frame(item_hex: &str) -> Result<Vec<u8>> {
-    let hex = item_hex.trim().trim_start_matches("0x").to_ascii_lowercase();
+    let hex = item_hex
+        .trim()
+        .trim_start_matches("0x")
+        .to_ascii_lowercase();
     if hex.len() != 4 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("NV item id must be 4 hex digits, got {item_hex:?}");
     }
     let hi = u8::from_str_radix(&hex[..2], 16)?;
     let lo = u8::from_str_radix(&hex[2..], 16)?;
-    Ok(vec![0x7E, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, hi, lo, 0x00, 0x00, 0x7E])
+    Ok(vec![
+        0x7E, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, hi, lo, 0x00, 0x00, 0x7E,
+    ])
 }
 
 /// One request/response round trip on a diag character node, with an overall
@@ -177,8 +182,13 @@ mod tests {
         let mut reply = vec![0x7E, 0x00, 0x00, 0x74, 0x00, 0x5E, 0x01];
         reply.extend_from_slice(&[0x4A, 0x09, 0x51, 0x24, 0x30, 0x32, 0x57, 0x81]);
         reply.push(0x7E);
-        assert_eq!(extract_imei(&reply, IMEI_RECORD_MARKER).as_deref(), Some("490154203237518"));
-        assert!(luhn_valid(&extract_imei(&reply, IMEI_RECORD_MARKER).unwrap()));
+        assert_eq!(
+            extract_imei(&reply, IMEI_RECORD_MARKER).as_deref(),
+            Some("490154203237518")
+        );
+        assert!(luhn_valid(
+            &extract_imei(&reply, IMEI_RECORD_MARKER).unwrap()
+        ));
     }
 
     #[test]

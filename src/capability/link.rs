@@ -49,9 +49,16 @@ impl Capability for Link {
         out.push(format!(
             "owning cmd={} urc={}",
             ctx.profile.channels.cmd,
-            ctx.profile.channels.urc.clone().unwrap_or_else(|| "(none)".into())
+            ctx.profile
+                .channels
+                .urc
+                .clone()
+                .unwrap_or_else(|| "(none)".into())
         ));
-        ctx.event("link", format!("channels acquired; probe={probe} every {interval}s for {seconds}s"));
+        ctx.event(
+            "link",
+            format!("channels acquired; probe={probe} every {interval}s for {seconds}s"),
+        );
 
         let deadline = Instant::now() + Duration::from_secs_f64(seconds.max(0.0));
         let mut probes_done: u64 = 0;
@@ -62,7 +69,10 @@ impl Capability for Link {
             let reply = session.probe_with(&probe, Duration::from_secs_f64(timeout));
             probes_done += 1;
             if reply.ok() {
-                ctx.event("probe", format!("{probe} ok in {} ms", reply.elapsed.as_millis()));
+                ctx.event(
+                    "probe",
+                    format!("{probe} ok in {} ms", reply.elapsed.as_millis()),
+                );
                 if first {
                     for line in &reply.lines {
                         out.push(format!("  {line}"));
@@ -70,7 +80,10 @@ impl Capability for Link {
                     out.push(format!("  {}", reply.final_code.as_str()));
                     first = false;
                 } else {
-                    out.push(format!("probe {probes_done} ok ({} ms)", reply.elapsed.as_millis()));
+                    out.push(format!(
+                        "probe {probes_done} ok ({} ms)",
+                        reply.elapsed.as_millis()
+                    ));
                 }
             } else {
                 failures += 1;
@@ -129,7 +142,11 @@ impl Capability for Link {
             ctx.note("mailbox interrupt count did not move during the run".to_string());
         }
 
-        let outcome = if pass { Outcome::pass(out) } else { Outcome::fail(out) };
+        let outcome = if pass {
+            Outcome::pass(out)
+        } else {
+            Outcome::fail(out)
+        };
         Ok(outcome)
     }
 }

@@ -309,8 +309,14 @@ mod tests {
 
     #[test]
     fn cell_lock_uses_the_rat_prefix() {
-        assert_eq!(cell_lock_command(Rat::Lte, 100, 88), "AT+SPFORCEFRQ=12,6,100,88");
-        assert_eq!(cell_lock_command(Rat::Nr, 627264, 5), "AT+SPFORCEFRQ=16,6,627264,5");
+        assert_eq!(
+            cell_lock_command(Rat::Lte, 100, 88),
+            "AT+SPFORCEFRQ=12,6,100,88"
+        );
+        assert_eq!(
+            cell_lock_command(Rat::Nr, 627264, 5),
+            "AT+SPFORCEFRQ=16,6,627264,5"
+        );
         assert_eq!(cell_unlock_command(Rat::Lte), "AT+SPFORCEFRQ=12,4");
         assert_eq!(cell_query_command(Rat::Nr), "AT+SPFORCEFRQ=16,3");
     }

@@ -20,7 +20,9 @@ fn main() {
     match cli::run(cli) {
         Ok(code) => exit(code),
         Err(err) => {
-            let environment = err.chain().any(|c| c.downcast_ref::<ChannelBusy>().is_some());
+            let environment = err
+                .chain()
+                .any(|c| c.downcast_ref::<ChannelBusy>().is_some());
             if environment {
                 eprintln!("unisoc-cpd: {err:#}");
                 exit(3);

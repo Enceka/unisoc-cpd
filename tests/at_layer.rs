@@ -27,7 +27,13 @@ fn rig(cmd_path: &Path, urc_path: Option<&Path>, lock: &Path, pace: f64) -> Rig 
     ));
     cmd.open().expect("open cmd");
     let urc = urc_path.map(|p| {
-        let c = Arc::new(SerialChannel::new(p, "urc", lock, Duration::from_millis(10), true));
+        let c = Arc::new(SerialChannel::new(
+            p,
+            "urc",
+            lock,
+            Duration::from_millis(10),
+            true,
+        ));
         c.open().expect("open urc");
         c
     });
@@ -149,7 +155,9 @@ fn an_error_final_code_is_reported_as_an_error() {
     let dir = scratch("error");
     let r = rig(&slave, None, &dir, 0.01);
 
-    let reply = r.session.command("AT+NOSUCHTHING", Duration::from_secs(2), &[], 0);
+    let reply = r
+        .session
+        .command("AT+NOSUCHTHING", Duration::from_secs(2), &[], 0);
 
     assert_eq!(reply.final_code, FinalCode::Error);
     assert!(!reply.ok());

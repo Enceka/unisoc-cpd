@@ -109,10 +109,10 @@ way it is:
 | SIM | `AT+CPIN?` → `+CPIN: READY` | `AT+CPIN="<pin>"` to unlock |
 | SIM identity | `AT+CIMI`, `AT+CCID` | read-only; **no IMEI path exists in this program** |
 | radio | `AT+CFUN?` → `+CFUN: 1` | a cold CP can read `1` with the stack still down |
-| stack on | `AT+SFUN=2`, `AT+SFUN=4` | the vendor-specific "really turn the stack on" |
+| stack on | `AT+SFUN=2`, `AT+SFUN=4` | the vendor-specific "really turn the stack on"; **after a RIL shutdown parks the radio at `+CFUN: 0`, this pair alone sets `+CFUN: 1` but does not register — the cold cycle `AT+CFUN=0` then `SFUN=2/4` is what does (measured, FINDINGS §25.3)** |
 | stack cycle | `AT+SFUN=5`, `AT+SFUN=3` | **avoid**: leaves this modem's SIM undetected until reboot |
 | registration | `AT+CEREG?`, `AT+CREG?`, `AT+CGATT?` | AcT is the 5th field: 11 = NR SA, 13 = EN-DC |
-| signal | `AT+CSQ`, `AT+CESQ` | `+CESQ: rxlev,ber,rscp,ecno,rsrq,rsrp,ssrsrq,ssrsrp,sssinr`; index→dBm is `idx-140` for RSRP |
+| signal | `AT+CSQ`, `AT+CESQ` | `+CESQ: rxlev,ber,rscp,ecno,rsrq,rsrp,ssrsrq,ssrsrp,sssinr`; index→dBm is `idx-140` for RSRP, and **255 means "not reported", not `idx 255` (measured: an unregistered CP answers 255 in every field)** |
 | operator | `AT+COPS?`, `AT+COPS=?`, `AT+COPS=0` | a full scan takes tens of seconds |
 | SMS | `AT+CMGF=1`, `AT+CMGL="ALL"`, `AT+CMGR=<i>`, `AT+CMGD=<i>`, `AT+CMGS="<n>"` | `+CMGS` answers with a bare `>` continuation prompt |
 | USSD | `AT+CUSD=1,"<code>",15` | `+CUSD: 0,"...",15` |
@@ -310,3 +310,118 @@ The IMEI is network identity — operators blacklist by it, and altering a
 device's identity to disguise it is a crime in a number of jurisdictions.
 Keep the factory value from the label or from the first backup you ever take;
 every write lands in the run summary with what and when.
+
+## 9. The control plane as a service (G2)
+
+G2 is the point at which the daemon stops answering questions *about* the modem
+and starts being the thing that answers *for* it.  On the Android side that
+seat is held by `urild`: it opens `/dev/stty_nr1` and `/dev/stty_nr0` at
+start-up, holds them for the whole boot, reads the unsolicited stream
+continuously, and every other component asks *it*.  The SIPC channel allows
+only one reader (§2), so the seat cannot be shared — it can only be taken
+over.  Provenance for this section: the channel behaviour and the URC lines
+are **measured** (§2, §3); the decoding table and the request/response shape
+are **researched**, on the same basis as §4.2 — the shape to try first.
+
+**This section has now been exercised on the device**: 2026-09-20, Android
+slot a, with the daemon as the only reader of both channels after
+`stop vendor.ril-daemon` — ownership, `link`, `sim`, `band`, `serve` + socket
+clients, and URC decoding all measured working; the ownership *transfer*
+procedure picked up one rule and the stack bring-up one requirement
+(FINDINGS §25).  Still open: the same on the Linux side, where the daemon has
+not yet been the owner at boot.
+
+### 9.1 Ownership over a boot, not over a command
+
+| | vendor side | ours (G2) |
+| --- | --- | --- |
+| who owns `nr1`/`nr0` | `urild`, for the lifetime of the boot | `unisoc-cpd serve`, for the lifetime of the boot |
+| how a request arrives | the RIL's own socket, framework above it | a unix socket, default `<state-dir>/cmd.sock` |
+| a second *caller* | served by the RIL | served by `serve`, over the socket |
+| a second *reader* | not possible — the RIL never closes the port | refused loudly, `ChannelBusy`, exit 3 (§2) |
+| the unsolicited stream | read forever, turned into framework notifications | read forever, decoded into the events of §9.2 |
+
+That shape is what the acceptance matrix actually needs: A2–A6 can be run as
+many times as wanted without ever releasing the channel, so the one-owner rule
+holds across the whole measurement window instead of across one command.
+`serve` also keeps the W1 duties alive while it works — an idle probe (a real
+`AT`, counted under `at.probes`, never under `at.commands`) runs whenever
+nothing else has touched the CP for `at.idle_probe_seconds`, and `state`
+reports `last_ok_age_s`, the number a watchdog keys on, because an open
+channel and an answering CP are two different facts (FINDINGS §22).
+
+### 9.2 The unsolicited stream, decoded
+
+The lines are the measured dump of §3; the per-line shapes below are what
+`core/urc.rs` commits to.  A line the decoder does not know is kept as
+`urc-other` with its text, never dropped: "the stream carried something we did
+not decode" is evidence, and silence is not.
+
+| URC | meaning | decoded as |
+| --- | --- | --- |
+| `+SIND: <code>[,<detail>…]` | SIM / storage indication (1 = SIM, 10 = ME storage) | `urc-sim-indication {code, detail}` |
+| `+CPIN: <state>` | SIM state (`READY`, `SIM PIN`, …) | `urc-sim-state {state}` |
+| `+CREG:`/`+CGREG:`/`+CEREG:`/`+C5GREG:` | CS / GPRS / EPS / 5G registration | `urc-registration {domain, status, act}` — `status` is field 2 of the measured `2,1,…` shape, `act` field 5 (7 = LTE, 11 = NR SA, 13 = EN-DC) |
+| `+CSQ: <rssi>,<ber>` | signal strength, raw indexes | `urc-signal {rssi, ber}` |
+| `+CESQ: …9 fields…` | signal quality | `urc-signal {rssi, ber, rsrp, rsrq, sinr}`, by the same decoder `signal` uses |
+| `+CGEV: …` | bearer event (PDN ACT/DEACT, detach) | `urc-bearer {text}` |
+| `+CMTI: "<storage>",<index>` | a message arrived into storage — **the MT SMS signal** | `urc-new-message {storage, index}` |
+| `+CMGW: ME is full` | message storage full | `urc-message-storage {text}` |
+| `RING` / `+CRING: <type>` | an incoming call | `urc-incoming-call {ring}` |
+| `+CLIP: "<number>",<type>…` | caller identity | `urc-caller-id {number, address_type}` |
+| `+CUSD: <status>,"<text>"[,<dcs>]` | USSD answer or network notification | `urc-ussd {status, text}` |
+| `+SPERROR: …` | this generation's own error report | `urc-sp-error {code, text}` |
+| anything else (`+ECIND:`, `+SPPCODATA:`, `+PRENWINFU:` …) | not decoded yet | `urc-other {line}`, kept verbatim |
+
+Deliberately **not** in this first G2 increment, and why:
+
+* `+CMT:` / `+CDS:` (a message delivered inline) map to `urc-other`.  Inline
+  delivery only happens when `AT+CNMI` asks for it; the measured path on this
+  generation is `+CMTI:` into storage, and the daemon does not set `CNMI`.
+* Act on `+CMTI:` — read the message, hand it to a client.  Classifying it is
+  the half that has to exist first; the read is A5's MT half.
+* `+ECIND:` (`3,0,0,1`, `3,6,1` measured) stays `urc-other`: its fields are not
+  established, so guessing them would be worse than reporting them raw.
+* MT call control (`urc-incoming-call` → `ATA`) and a D-Bus/ModemManager face
+  in front of the socket, which is what lets `gnome-calls`/`chatty` use any of
+  this (plan, `core/api`).
+
+### 9.3 The request/response contract
+
+One request per connection, one JSON object per line — the shape the sibling
+port's AT daemon already proves on this modem family — except that what is
+asked for here is a **capability**, never a raw AT string.  Raw AT over a
+socket would move the ownership rule out of the one process that enforces it,
+and the red line would be a convention again.
+
+```
+$ unisoc-cpd --profile e5 --mode native serve --socket /run/unisoc-cpd/cmd.sock
+$ unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock sim
++CPIN: READY
+status: pass
+```
+
+| request | answered with |
+| --- | --- |
+| `{"capability":"<name>","args":[…]}` — action defaults to `run` | that capability's own output, `status`, `exit_code`, `notes` |
+| `{"action":"state"}` | the daemon's state: pid, uptime, requests, idle probes, `last_ok_age_s`, channel and AT metrics, URC counts, the last 20 decoded events |
+| `{"action":"urc","limit":N}` | the last `N` decoded URC events, oldest first |
+
+An unknown capability, a malformed line, or asking for `serve` itself is an
+error in the response, not a dropped connection.  Every `run` writes its own
+run summary on the daemon's side (that is where the run happened), with the
+URCs that arrived while it was in flight recorded as its events; its telemetry
+baseline is re-taken per request, so the deltas are per run and not per boot.
+
+Exit codes are unchanged: `0` pass, `1` fail, `2` usage/config — including a
+request the daemon rejects — and `3` environment, which now covers both "the
+channel is owned by someone else" and "there is no daemon on that socket".
+
+Two details that are easy to get wrong and are pinned by tests:
+
+* only a `run` resets the idle timer.  A client polling `state` must not be
+  able to postpone the probe — keeping the link warm is the daemon's job, not
+  a side-effect of being watched;
+* a live socket is refused before the channel is touched, so an owner that is
+  already serving never even sees the next daemon reach for its lock; a stale
+  socket file (SIGTERM does not unwind, so it is normal) is removed.

@@ -4,12 +4,17 @@
 //! layer; `vendor` still lets the vendor daemon do the work and only records
 //! what it produced.  The same acceptance test has to pass in both before the
 //! vendor side can be switched off, so the vendor path lives here too.
+//!
+//! `serve` is the odd one out and is here on purpose: it is not something the
+//! daemon does *to* the modem, it is the daemon holding the channel so that
+//! every other verb can be asked for by name (`core/capability/serve.rs`).
 
 pub mod control;
 pub mod data;
 pub mod imei;
 pub mod link;
 pub mod radio;
+pub mod serve;
 pub mod side;
 
 use crate::context::Context;
@@ -30,11 +35,17 @@ pub struct Outcome {
 
 impl Outcome {
     pub fn pass(output: Vec<String>) -> Self {
-        Self { status: Status::Pass, output }
+        Self {
+            status: Status::Pass,
+            output,
+        }
     }
 
     pub fn fail(output: Vec<String>) -> Self {
-        Self { status: Status::Fail, output }
+        Self {
+            status: Status::Fail,
+            output,
+        }
     }
 
     pub fn passed(&self) -> bool {
@@ -74,6 +85,7 @@ pub fn find(name: &str) -> Option<Box<dyn Capability>> {
         Box::new(imei::Imei),
         Box::new(side::Nv),
         Box::new(side::Diag),
+        Box::new(serve::Serve),
     ];
     all.into_iter().find(|c| c.name() == name)
 }
@@ -81,7 +93,7 @@ pub fn find(name: &str) -> Option<Box<dyn Capability>> {
 pub fn catalogue() -> Vec<(&'static str, &'static str, bool)> {
     let names = [
         "link", "sim", "cfun", "register", "signal", "operator", "band", "nr", "ims", "sms",
-        "ussd", "call", "data", "imei", "nv", "diag",
+        "ussd", "call", "data", "imei", "nv", "diag", "serve",
     ];
     names
         .iter()
@@ -150,8 +162,15 @@ pub fn run_vendor(ctx: &Context, capability: &str, args: &[String]) -> Result<Ou
     if !stderr.trim().is_empty() {
         lines.push(format!("!stderr: {}", stderr.trim()));
     }
-    let status = if out.status.success() { Status::Pass } else { Status::Fail };
-    Ok(Outcome { status, output: lines })
+    let status = if out.status.success() {
+        Status::Pass
+    } else {
+        Status::Fail
+    };
+    Ok(Outcome {
+        status,
+        output: lines,
+    })
 }
 
 /// Send one AT command and hand the reply back, recording it for the summary.

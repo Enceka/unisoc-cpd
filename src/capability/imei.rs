@@ -84,7 +84,9 @@ pub fn parse_write_args(args: &[String]) -> Result<(String, u32, Option<String>)
 
 /// Substitute the profile's write template.  Pure, testable.
 pub fn render_write_command(template: &str, imei: &str, index: u32) -> String {
-    template.replace("{imei}", imei).replace("{index}", &index.to_string())
+    template
+        .replace("{imei}", imei)
+        .replace("{index}", &index.to_string())
 }
 
 fn item_id_for(ctx: &Context, index: u32) -> Result<String> {
@@ -270,7 +272,10 @@ impl Capability for Imei {
                     .cloned()
                     .collect();
                 if nodes.is_empty() {
-                    bail!("profile {:?} lists no NV partitions to back up", ctx.profile.name);
+                    bail!(
+                        "profile {:?} lists no NV partitions to back up",
+                        ctx.profile.name
+                    );
                 }
                 let dir =
                     super::side::backup_nv_nodes(ctx, &mut out, backup_dir.as_deref(), &nodes)?;
@@ -328,7 +333,10 @@ mod tests {
     #[test]
     fn write_args_demand_yes_and_a_valid_imei() {
         let good = "490154203237518";
-        assert!(parse_write_args(&args(&["write"])).is_err(), "--yes required");
+        assert!(
+            parse_write_args(&args(&["write"])).is_err(),
+            "--yes required"
+        );
         assert!(
             parse_write_args(&args(&["write", good])).is_err(),
             "a bare candidate value must still refuse without --yes"
@@ -359,9 +367,17 @@ mod tests {
             "/tmp/b",
         ]))
         .unwrap();
-        assert_eq!((parsed.as_str(), index, dir.as_deref()), (good, 1, Some("/tmp/b")));
+        assert_eq!(
+            (parsed.as_str(), index, dir.as_deref()),
+            (good, 1, Some("/tmp/b"))
+        );
         // Default index: 0, the first SIM slot, because the CP counts from zero.
-        assert_eq!(parse_write_args(&args(&["write", good, "--yes"])).unwrap().1, 0);
+        assert_eq!(
+            parse_write_args(&args(&["write", good, "--yes"]))
+                .unwrap()
+                .1,
+            0
+        );
     }
 
     #[test]

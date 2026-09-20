@@ -67,7 +67,13 @@ struct Counters {
 
 impl Counters {
     fn snapshot(&self) -> ChannelMetrics {
-        let ms = |v: u64| if v == 0 { None } else { Some(v as f64 / 1000.0) };
+        let ms = |v: u64| {
+            if v == 0 {
+                None
+            } else {
+                Some(v as f64 / 1000.0)
+            }
+        };
         let m = ChannelMetrics {
             opens: self.opens.load(Ordering::Relaxed),
             reopens: self.reopens.load(Ordering::Relaxed),
@@ -104,8 +110,8 @@ fn set_raw(fd: RawFd) {
         t.c_iflag = 0;
         t.c_oflag = 0;
         t.c_lflag = 0;
-        t.c_cflag = (t.c_cflag | libc::CS8 | libc::CREAD | libc::CLOCAL)
-            & !(libc::PARENB | libc::CSTOPB);
+        t.c_cflag =
+            (t.c_cflag | libc::CS8 | libc::CREAD | libc::CLOCAL) & !(libc::PARENB | libc::CSTOPB);
         t.c_cc[libc::VMIN] = 0;
         t.c_cc[libc::VTIME] = 0;
         let _ = libc::tcsetattr(fd, libc::TCSANOW, &t);
@@ -313,7 +319,9 @@ impl SerialChannel {
     /// Write bytes with no terminator (the SMS body, terminated by the caller).
     pub fn write_payload(&self, text: &str) -> Result<()> {
         let guard = self.file.lock().unwrap();
-        let file = guard.as_ref().ok_or_else(|| anyhow::anyhow!("{} is not open", self.name))?;
+        let file = guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("{} is not open", self.name))?;
         let fd = file.as_raw_fd();
         let n = unsafe { libc::write(fd, text.as_ptr() as *const libc::c_void, text.len()) };
         if n < 0 {
@@ -321,13 +329,18 @@ impl SerialChannel {
             self.shared.dead.store(true, Ordering::SeqCst);
             bail!("write to {} failed: {err}", self.path.display());
         }
-        self.shared.counters.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+        self.shared
+            .counters
+            .tx_bytes
+            .fetch_add(n as u64, Ordering::Relaxed);
         Ok(())
     }
 
     pub fn write_line(&self, text: &str) -> Result<()> {
         let guard = self.file.lock().unwrap();
-        let file = guard.as_ref().ok_or_else(|| anyhow::anyhow!("{} is not open", self.name))?;
+        let file = guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("{} is not open", self.name))?;
         let fd = file.as_raw_fd();
         let payload = format!("{text}\r");
         let n = unsafe { libc::write(fd, payload.as_ptr() as *const libc::c_void, payload.len()) };
@@ -336,8 +349,14 @@ impl SerialChannel {
             self.shared.dead.store(true, Ordering::SeqCst);
             bail!("write to {} failed: {err}", self.path.display());
         }
-        self.shared.counters.tx_lines.fetch_add(1, Ordering::Relaxed);
-        self.shared.counters.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+        self.shared
+            .counters
+            .tx_lines
+            .fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .counters
+            .tx_bytes
+            .fetch_add(n as u64, Ordering::Relaxed);
         self.shared
             .counters
             .last_tx_ms
@@ -394,7 +413,10 @@ fn reader_loop(shared: Arc<Shared>) {
         if n == 0 {
             continue;
         }
-        shared.counters.rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+        shared
+            .counters
+            .rx_bytes
+            .fetch_add(n as u64, Ordering::Relaxed);
         buf.extend_from_slice(&chunk[..n as usize]);
 
         loop {
@@ -468,7 +490,10 @@ mod tests {
         let rc = unsafe { libc::ptsname_r(master, name.as_mut_ptr(), name.len()) };
         assert_eq!(rc, 0, "ptsname_r failed");
         let cstr = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
-        (unsafe { File::from_raw_fd(master) }, PathBuf::from(cstr.to_str().unwrap()))
+        (
+            unsafe { File::from_raw_fd(master) },
+            PathBuf::from(cstr.to_str().unwrap()),
+        )
     }
 
     fn master_writer(m: &File) -> std::fs::File {
@@ -491,7 +516,10 @@ mod tests {
         let mut w = master_writer(&master);
         w.write_all(b"+CSQ: 22,99\r\n").unwrap();
         w.write_all(b"OK\r\n").unwrap();
-        assert_eq!(ch.read_line(Duration::from_secs(2)).as_deref(), Some("+CSQ: 22,99"));
+        assert_eq!(
+            ch.read_line(Duration::from_secs(2)).as_deref(),
+            Some("+CSQ: 22,99")
+        );
         assert_eq!(ch.read_line(Duration::from_secs(2)).as_deref(), Some("OK"));
         assert_eq!(ch.metrics().rx_lines, 2);
         ch.close();

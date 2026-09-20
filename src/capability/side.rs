@@ -138,18 +138,27 @@ pub(crate) fn backup_nv_nodes(
 
 /// The sha256 a manifest.json next to `image` vouches for, if one does.
 fn manifest_sha_for(image: &Path) -> Result<Option<String>> {
-    let manifest = image.parent().unwrap_or(Path::new(".")).join("manifest.json");
+    let manifest = image
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("manifest.json");
     if !manifest.exists() {
         return Ok(None);
     }
-    let text =
-        std::fs::read_to_string(&manifest).with_context(|| format!("reading {}", manifest.display()))?;
-    let entries: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("parsing {}", manifest.display()))?;
-    let wanted = image.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let text = std::fs::read_to_string(&manifest)
+        .with_context(|| format!("reading {}", manifest.display()))?;
+    let entries: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", manifest.display()))?;
+    let wanted = image
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
     for e in entries.as_array().into_iter().flatten() {
         if e.get("file").and_then(|v| v.as_str()) == Some(wanted) {
-            return Ok(e.get("sha256").and_then(|v| v.as_str()).map(|s| s.to_string()));
+            return Ok(e
+                .get("sha256")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()));
         }
     }
     Ok(None)
@@ -411,7 +420,11 @@ impl Capability for Diag {
             out.push(format!(
                 "cmd {} urc {}",
                 ctx.profile.channels.cmd,
-                ctx.profile.channels.urc.clone().unwrap_or_else(|| "(none)".into())
+                ctx.profile
+                    .channels
+                    .urc
+                    .clone()
+                    .unwrap_or_else(|| "(none)".into())
             ));
             for name in ["cmd", "urc"] {
                 if let Some(ch) = ctx.channel(name) {

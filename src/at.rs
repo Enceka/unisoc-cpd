@@ -94,7 +94,10 @@ pub fn classify(line: &str) -> Option<FinalCode> {
 /// `AT+CSQ` -> `+CSQ:`.  Used to tell a response from a URC.
 pub fn infer_expect(cmd: &str) -> Vec<String> {
     let c = cmd.trim();
-    let c = c.strip_prefix("AT").or_else(|| c.strip_prefix("at")).unwrap_or(c);
+    let c = c
+        .strip_prefix("AT")
+        .or_else(|| c.strip_prefix("at"))
+        .unwrap_or(c);
     let name: String = c
         .chars()
         .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '^' || *ch == '$' || *ch == '+')
@@ -148,11 +151,17 @@ impl Reply {
     }
 
     pub fn first_with_prefix(&self, prefix: &str) -> Option<&str> {
-        self.lines.iter().find(|l| l.starts_with(prefix)).map(|s| s.as_str())
+        self.lines
+            .iter()
+            .find(|l| l.starts_with(prefix))
+            .map(|s| s.as_str())
     }
 
     pub fn line_with<'a>(&'a self, needle: &str) -> Option<&'a str> {
-        self.lines.iter().find(|l| l.contains(needle)).map(|s| s.as_str())
+        self.lines
+            .iter()
+            .find(|l| l.contains(needle))
+            .map(|s| s.as_str())
     }
 }
 
@@ -337,7 +346,10 @@ impl AtSession {
                 if remaining.is_zero() {
                     break;
                 }
-                let Some(line) = self.cmd.read_line(remaining.min(Duration::from_millis(500))) else {
+                let Some(line) = self
+                    .cmd
+                    .read_line(remaining.min(Duration::from_millis(500)))
+                else {
                     if !self.cmd.healthy() {
                         final_code = Some(FinalCode::ChannelDown);
                         break;
@@ -451,7 +463,10 @@ impl AtSession {
         let mut lines = Vec::new();
         while Instant::now() < prompt_deadline {
             let remaining = prompt_deadline.saturating_duration_since(Instant::now());
-            match self.cmd.read_line(remaining.min(Duration::from_millis(300))) {
+            match self
+                .cmd
+                .read_line(remaining.min(Duration::from_millis(300)))
+            {
                 Some(l) if l.trim_end().ends_with('>') => {
                     saw_prompt = true;
                     break;
@@ -478,7 +493,10 @@ impl AtSession {
             let deadline = Instant::now() + timeout;
             while Instant::now() < deadline {
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                match self.cmd.read_line(remaining.min(Duration::from_millis(500))) {
+                match self
+                    .cmd
+                    .read_line(remaining.min(Duration::from_millis(500)))
+                {
                     Some(l) => {
                         if let Some(code) = classify(&l) {
                             reply.final_code = code;
@@ -562,7 +580,10 @@ mod tests {
     fn final_codes_are_recognised() {
         assert_eq!(classify("OK"), Some(FinalCode::Ok));
         assert_eq!(classify("ERROR"), Some(FinalCode::Error));
-        assert_eq!(classify("+CME ERROR: 3"), Some(FinalCode::CmeError(": 3".into())));
+        assert_eq!(
+            classify("+CME ERROR: 3"),
+            Some(FinalCode::CmeError(": 3".into()))
+        );
         assert_eq!(classify("NO CARRIER"), Some(FinalCode::NoCarrier));
         assert!(matches!(classify("CONNECT"), Some(FinalCode::Connect(_))));
         assert_eq!(classify("+CSQ: 20,99"), None);
@@ -573,7 +594,10 @@ mod tests {
     fn expect_prefix_is_inferred() {
         assert_eq!(infer_expect("AT+CSQ"), vec!["+CSQ:".to_string()]);
         assert_eq!(infer_expect("AT+CEREG?"), vec!["+CEREG:".to_string()]);
-        assert_eq!(infer_expect("AT+CGDCONT=1,\"IPV4V6\",\"x\""), vec!["+CGDCONT:".to_string()]);
+        assert_eq!(
+            infer_expect("AT+CGDCONT=1,\"IPV4V6\",\"x\""),
+            vec!["+CGDCONT:".to_string()]
+        );
         assert!(infer_expect("AT").is_empty());
         assert!(infer_expect("ATD123;").is_empty());
     }

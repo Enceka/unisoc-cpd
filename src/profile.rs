@@ -292,8 +292,8 @@ impl Profile {
 pub fn load_file(path: &Path) -> Result<Profile> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read profile {}", path.display()))?;
-    let mut p = Profile::from_toml_str(&text)
-        .with_context(|| format!("in profile {}", path.display()))?;
+    let mut p =
+        Profile::from_toml_str(&text).with_context(|| format!("in profile {}", path.display()))?;
     p.path = Some(path.to_path_buf());
     Ok(p)
 }

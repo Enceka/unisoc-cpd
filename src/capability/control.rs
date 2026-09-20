@@ -64,7 +64,11 @@ impl Capability for Sim {
                 emit(&mut out, &cmd, &r);
                 let after = session.command("AT+CPIN?", t, &[], 0);
                 emit(&mut out, "AT+CPIN?", &after);
-                let ok = r.ok() && after.first_with_prefix("+CPIN:").map(|l| l.contains("READY")).unwrap_or(false);
+                let ok = r.ok()
+                    && after
+                        .first_with_prefix("+CPIN:")
+                        .map(|l| l.contains("READY"))
+                        .unwrap_or(false);
                 return Ok(outcome(out, ok));
             }
         }
@@ -74,7 +78,14 @@ impl Capability for Sim {
         let state = r.first_with_prefix("+CPIN:").unwrap_or("");
         let ready = state.contains("READY");
         if !ready {
-            ctx.note(format!("SIM not ready: {}", if state.is_empty() { "(no +CPIN)" } else { state }));
+            ctx.note(format!(
+                "SIM not ready: {}",
+                if state.is_empty() {
+                    "(no +CPIN)"
+                } else {
+                    state
+                }
+            ));
         }
         Ok(outcome(out, r.ok() && ready))
     }
@@ -120,7 +131,10 @@ impl Capability for Cfun {
                 }
                 let r = session.command("AT+CFUN?", Duration::from_secs(5), &[], 0);
                 emit(&mut out, "AT+CFUN?", &r);
-                ok = r.first_with_prefix("+CFUN:").map(|l| l.contains('1')).unwrap_or(false);
+                ok = r
+                    .first_with_prefix("+CFUN:")
+                    .map(|l| l.contains('1'))
+                    .unwrap_or(false);
             }
             "reset" => {
                 let r = session.command("AT+SFUN=4", Duration::from_secs(25), &[], 0);
@@ -243,10 +257,24 @@ impl Capability for Signal {
 
         if let Some(line) = cesq.first_with_prefix("+CESQ:") {
             if let Some((rsrp, rsrq, sinr)) = decode_cesq(line) {
-                let sinr = sinr
-                    .map(|v| format!("{v:.1} dB"))
-                    .unwrap_or_else(|| "n/a".to_string());
-                out.push(format!("decoded: RSRP {rsrp} dBm, RSRQ {rsrq:.1} dB, SINR {sinr}"));
+                // A field the modem did not report must not look like a very
+                // bad reading: "not reported" is a fact, "-115 dBm" is a lie
+                // the reader will believe.  Measured on the device: the idle
+                // CP answers 255 for every field.
+                let dbm = |v: Option<i32>| {
+                    v.map(|v| format!("{v} dBm"))
+                        .unwrap_or_else(|| "not reported".to_string())
+                };
+                let db = |v: Option<f64>| {
+                    v.map(|v| format!("{v:.1} dB"))
+                        .unwrap_or_else(|| "not reported".to_string())
+                };
+                out.push(format!(
+                    "decoded: RSRP {}, RSRQ {}, SINR {}",
+                    dbm(rsrp),
+                    db(rsrq),
+                    db(sinr)
+                ));
             }
         }
         let ok = each(&mut out, &[("AT+CSQ", csq), ("AT+CESQ", cesq)]);
@@ -255,16 +283,22 @@ impl Capability for Signal {
 }
 
 /// `+CESQ: rxlev,ber,rscp,ecno,rsrq,rsrp[,ssrsrq,ssrsrp,sssinr]`
-pub fn decode_cesq(line: &str) -> Option<(i32, f64, Option<f64>)> {
+///
+/// `255` is 3GPP's "not reported" marker, not an index: decoding it as
+/// `idx-140` yields "115 dBm", which a reader will believe.  An unreported
+/// field comes back as `None` so the display can say so.  (Measured on the
+/// device, 2026-09-20: an unregistered CP answers 255 in every field.)
+pub fn decode_cesq(line: &str) -> Option<(Option<i32>, Option<f64>, Option<f64>)> {
     let body = line.split_once(':')?.1;
     let parts: Vec<&str> = body.split(',').map(|s| s.trim()).collect();
     let idx = |i: usize| parts.get(i).and_then(|v| v.parse::<i32>().ok());
     let rsrp_idx = idx(5)?;
     let rsrq_idx = idx(4)?;
     // 3GPP mapping over the reported *index*, 0..97 -> -140..-44 dBm.
-    let rsrp = rsrp_idx - 140;
-    let rsrq = -19.5 + rsrq_idx as f64 * 0.5;
-    let sinr = idx(8).map(|v| (v as f64 - 20.0) / 2.0);
+    let reported = |v: i32| (v != 255).then_some(v);
+    let rsrp = reported(rsrp_idx).map(|idx| idx - 140);
+    let rsrq = reported(rsrq_idx).map(|idx| -19.5 + idx as f64 * 0.5);
+    let sinr = idx(8).and_then(reported).map(|v| (v as f64 - 20.0) / 2.0);
     Some((rsrp, rsrq, sinr))
 }
 
@@ -315,7 +349,9 @@ impl Capability for Operator {
                 emit(&mut out, &cmd, &r);
                 ok = r.ok();
             }
-            other => anyhow::bail!("operator: unknown action {other:?} (status|scan|auto|manual <mccmnc>)"),
+            other => anyhow::bail!(
+                "operator: unknown action {other:?} (status|scan|auto|manual <mccmnc>)"
+            ),
         }
         Ok(outcome(out, ok))
     }
@@ -388,7 +424,9 @@ impl Capability for Sms {
                 emit(&mut out, &format!("{cmd} <text>"), &r);
                 ok &= r.ok() && r.line_with("+CMGS:").is_some();
             }
-            other => anyhow::bail!("sms: unknown action {other:?} (list|read <i>|delete <i|all>|send <num> <text>)"),
+            other => anyhow::bail!(
+                "sms: unknown action {other:?} (list|read <i>|delete <i|all>|send <num> <text>)"
+            ),
         }
         Ok(outcome(out, ok))
     }
@@ -455,7 +493,8 @@ impl Capability for Call {
         if !ctx.profile.voice.supported {
             let mut out = vec![
                 "voice is not marked supported in this profile".to_string(),
-                "AT call control is still reachable, but there is no in-call audio path".to_string(),
+                "AT call control is still reachable, but there is no in-call audio path"
+                    .to_string(),
             ];
             let session = ctx.at()?;
             let r = session.command("AT+CLCC", Duration::from_secs(8), &[], 0);
@@ -505,7 +544,9 @@ impl Capability for Call {
                 emit(&mut out, "AT+CLCC", &r);
                 ok = r.ok();
             }
-            other => anyhow::bail!("call: unknown action {other:?} (dial <n>|answer|hangup|dtmf <d>|list)"),
+            other => anyhow::bail!(
+                "call: unknown action {other:?} (dial <n>|answer|hangup|dtmf <d>|list)"
+            ),
         }
         Ok(outcome(out, ok))
     }
@@ -516,17 +557,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cesq_decodes_the_index_mapping() {
-        let (rsrp, rsrq, _) = decode_cesq("+CESQ: 99,99,255,255,255,255,75,67,73").unwrap();
-        assert_eq!(rsrp, 255 - 140);
-        assert_eq!(rsrq, -19.5 + 255.0 * 0.5);
+    fn cesq_treats_255_as_not_reported() {
+        // The measured idle answer: every field 255.  Decoding it as an index
+        // yields "115 dBm", which is exactly the lie this test pins out.
+        let (rsrp, rsrq, sinr) = decode_cesq("+CESQ: 99,99,255,255,255,255,75,67,73").unwrap();
+        assert_eq!(rsrp, None);
+        assert_eq!(rsrq, None);
+        // The SS-SINR field (73) *was* reported, and only it decodes.
+        assert_eq!(sinr, Some(26.5));
+    }
+
+    /// A short `+CESQ` (no SS- fields at all) still decodes the ones it has.
+    #[test]
+    fn cesq_without_the_ss_fields_still_decodes() {
+        let (rsrp, rsrq, sinr) = decode_cesq("+CESQ: 99,99,255,255,20,60").unwrap();
+        assert_eq!(rsrp, Some(-80));
+        assert_eq!(rsrq, Some(-9.5));
+        assert_eq!(sinr, None);
     }
 
     #[test]
     fn cesq_decodes_a_real_reading() {
         // rsrp index 60 -> -80 dBm, rsrq index 20 -> -9.5 dB
         let (rsrp, rsrq, _) = decode_cesq("+CESQ: 99,99,255,255,20,60,75,67,73").unwrap();
-        assert_eq!(rsrp, -80);
-        assert!((rsrq - (-9.5)).abs() < 1e-9);
+        assert_eq!(rsrp, Some(-80));
+        assert_eq!(rsrq, Some(-9.5));
     }
 }

@@ -21,7 +21,11 @@ impl CounterDelta {
             (Some(a), Some(b)) => Some(b - a),
             _ => None,
         };
-        Self { before, after, delta }
+        Self {
+            before,
+            after,
+            delta,
+        }
     }
 }
 
@@ -46,7 +50,9 @@ impl NetCounters {
 }
 
 fn read_trim(path: &Path) -> Option<String> {
-    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 /// Sum every CPU column of the interrupt lines whose text matches `needle`.
@@ -58,7 +64,9 @@ pub fn mailbox_irq_count(needle: &str) -> Option<u64> {
         if !line.contains(needle) {
             continue;
         }
-        let Some((_, rest)) = line.split_once(':') else { continue };
+        let Some((_, rest)) = line.split_once(':') else {
+            continue;
+        };
         for token in rest.split_whitespace() {
             match token.parse::<u64>() {
                 Ok(v) => total += v,
@@ -83,7 +91,10 @@ pub fn net_counters(ifname: &str) -> Option<NetCounters> {
         read_trim(&base.join("statistics").join(name))?.parse().ok()
     };
     let mut ipv4 = Vec::new();
-    if let Ok(out) = std::process::Command::new("ip").args(["-4", "-o", "addr", "show", ifname]).output() {
+    if let Ok(out) = std::process::Command::new("ip")
+        .args(["-4", "-o", "addr", "show", ifname])
+        .output()
+    {
         if out.status.success() {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 if let Some(addr) = line.split_whitespace().nth(3) {

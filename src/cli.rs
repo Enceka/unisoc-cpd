@@ -40,6 +40,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub state_dir: Option<PathBuf>,
 
+    /// Ask the resident owner (`serve`) at this socket instead of opening the
+    /// channel here; `serve` itself listens on it (default: <state-dir>/cmd.sock)
+    #[arg(long, global = true)]
+    pub socket: Option<PathBuf>,
+
     /// Do not write a run summary
     #[arg(long, global = true)]
     pub no_telemetry: bool,
@@ -74,7 +79,10 @@ fn print_profiles(dir: Option<&std::path::Path>) -> Result<()> {
                 p.channels.cmd.clone(),
             )),
             Err(e) => rows.push((
-                path.file_stem().unwrap_or_default().to_string_lossy().to_string(),
+                path.file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
                 format!("INVALID: {e}"),
                 false,
                 String::new(),
@@ -82,9 +90,15 @@ fn print_profiles(dir: Option<&std::path::Path>) -> Result<()> {
         }
     }
     rows.sort();
-    println!("{:<10} {:<18} {:<9} {}", "name", "generation", "verified", "cmd channel");
+    println!(
+        "{:<10} {:<18} {:<9} {}",
+        "name", "generation", "verified", "cmd channel"
+    );
     for (name, gen, verified, cmd) in rows {
-        println!("{name:<10} {gen:<18} {:<9} {cmd}", if verified { "yes" } else { "no" });
+        println!(
+            "{name:<10} {gen:<18} {:<9} {cmd}",
+            if verified { "yes" } else { "no" }
+        );
     }
     Ok(())
 }
@@ -113,9 +127,26 @@ pub fn run(cli: Cli) -> Result<i32> {
         _ => {}
     }
 
-    let profile = profile::resolve(cli.profile.as_deref(), cli.profiles_dir.as_deref())?;
     let mode = Mode::parse(&cli.mode)?;
-    let runs_dir = cli.runs_dir.clone().unwrap_or_else(|| PathBuf::from("runs"));
+
+    // `--socket` means "the daemon already owns the channel, ask it" — which is
+    // the whole point of G2, and the only way a capability can run while
+    // `serve` holds the port.  `serve` is the exception: for it, `--socket` is
+    // where to listen, so it goes down the direct path.
+    if let Some(socket) = &cli.socket {
+        if cli.capability != "serve" {
+            if mode == Mode::Vendor {
+                bail!("--socket asks our own daemon; a vendor run has no socket to ask");
+            }
+            return crate::capability::serve::client(socket, &cli.capability, &cli.args);
+        }
+    }
+
+    let profile = profile::resolve(cli.profile.as_deref(), cli.profiles_dir.as_deref())?;
+    let runs_dir = cli
+        .runs_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("runs"));
     let state_dir = cli
         .state_dir
         .clone()
@@ -131,6 +162,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         cli.verbose > 0,
         argv,
     );
+    ctx.telemetry = !cli.no_telemetry;
     ctx.verbose(format!(
         "profile {} ({}) from {}",
         ctx.profile.name,
@@ -153,9 +185,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         capability::run_vendor(&ctx, &capability_name, &cli.args)?
     } else {
         let Some(cap) = capability::find(&capability_name) else {
-            bail!(
-                "unknown capability '{capability_name}'; try `unisoc-cpd capabilities`"
-            );
+            bail!("unknown capability '{capability_name}'; try `unisoc-cpd capabilities`");
         };
         cap.run(&mut ctx, &cli.args)?
     };

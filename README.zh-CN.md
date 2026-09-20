@@ -23,22 +23,23 @@
 unisoc-cpd / ucpd              一个二进制，一份 profile
 ├── src/channel.rs             通道层：独占持有、持续排空、健康计数
 ├── src/at.rs                  AT 编解码、URC 分流、串行化、限速、超时
+├── src/urc.rs                 URC 解码：控制面的主动一半（MT 短信/来电/注册/信号）
 ├── src/unisoc_at.rs           本代 CP 自己的 AT 扩展（频段/小区/5G/IMS）
-├── src/capability/            各项能力（见第 6 节）
+├── src/capability/            各项能力（见第 6 节）；serve 是常驻持有者
 ├── src/telemetry.rs           每次运行的 JSON 摘要
 ├── src/profile_check.rs       A12 可移植性门禁（做成命令）
 ├── platform/profiles/e5.toml     唯一知道 E5 的文件
 ├── platform/profiles/mu300.toml  第二个平台，同一核心（桩，未验证）
-├── units/                     systemd 浸泡单元
+├── units/                     systemd 单元：浸泡（timer）+ 常驻持有者
 ├── tools/build-aarch64.sh     交叉编译脚本
-└── docs/BASEBAND-CONTRACTS.md 通道/命令/时序契约
+└── docs/BASEBAND-CONTRACTS.md 通道/命令/时序契约（§9 是 G2 的控制面契约）
 ```
 
 ## 3. 构建与测试
 
 ```sh
 cargo build --release        # 主机
-cargo test                   # 66 个测试，不需要设备
+cargo test                   # 98 个测试，不需要设备
 ```
 
 测试跑在一个 **pty 上的伪 CP** 上。pty 是 SIPC tty 唯一诚实的替身：真 tty、两端、驱动按突发交付行。伪 CP 会在**每一条应答里插入一条 URC**，所以"URC 与应答分流"、"限速"、"超时"、`>` 续行提示符这四条路径**每条命令都会被走到**，而不是只在顺利路径上被走到。
@@ -71,6 +72,7 @@ unisoc-cpd [选项] <能力> [参数...]
 | `--mode native\|vendor` | 默认 `native` |
 | `--runs-dir <目录>` | 运行摘要写入位置（默认 `./runs`） |
 | `--state-dir <目录>` | 通道独占锁位置（默认 `/run/unisoc-cpd`） |
+| `--socket <路径>` | 交给常驻守护进程：对其它能力是“去问它”，对 `serve` 是“在这里听” |
 | `--no-telemetry` | 不写运行摘要 |
 | `-v` | 详细输出 |
 
@@ -83,6 +85,25 @@ unisoc-cpd capabilities     # 列出所有能力
 unisoc-cpd profiles         # 列出所有平台 profile
 unisoc-cpd profile-check    # 跑 A12 门禁，通过返回 0
 ```
+
+### 常驻持有者（G2）
+
+`serve` 是 Android 那一侧 `urild` 坐的那个位置：开机独占两条通道、持续读
+URC、空闲时探活，并在 unix socket 上以 JSON 应答能力请求。**只允许一条 AT
+通道一个读者**，所以能力要么直连通道，要么问守护进程，不能两者并存：
+
+```sh
+unisoc-cpd --profile e5 --mode native serve --socket /run/unisoc-cpd/cmd.sock
+
+# 另一个终端：通道已被守护进程持有，能力必须问它，而不是自己开通道
+unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock sim
+unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock register status
+unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock state   # 守护进程状态（含 last_ok_age_s）
+unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock urc     # 最近解码出的 URC 事件
+```
+
+契约（URC→事件表、请求/应答、哪些是有意不做的）在
+[`docs/BASEBAND-CONTRACTS.md`](docs/BASEBAND-CONTRACTS.md) §9。
 
 ### 两种模式
 
@@ -121,6 +142,7 @@ unisoc-cpd profile-check    # 跑 A12 门禁，通过返回 0
 | `imei` | 设备身份（带护栏） | `read [--index N]` `probe` `write <串号> --index N --yes` |
 | `nv` | NV 视图与受护栏的备份/恢复 | `list` `hash <分区>` `[--head 字节数]` `backup [--dir D]` `restore <分区> <镜像> --yes` |
 | `diag` | 诊断 | `channels` `spools` `mailbox` `asserts` `urc` `all` |
+| `serve` | **G2**：常驻持有者，代替 Android 的 RIL 坐住通道 | `[--socket 路径]` `[--seconds N]`；客户端用 `--socket` + `<能力>`，或问它 `state` / `urc` |
 
 写操作都会**回读校验**：`band lock` 写完立刻读回，没生效就不算通过——"调制解调器收下了命令"和"锁定真的生效了"是两回事。
 
@@ -194,23 +216,33 @@ cp -r units/* /etc/systemd/system/ && systemctl daemon-reload
 systemctl enable --now unisoc-cpd-soak.timer
 ```
 
+**接管控制面**（G2）用常驻单元而不是浸泡 timer：它声明了对旧 AT 代理的
+`Conflicts=`，启动时由 systemd 替我们停掉它们——这正是“接管”而不是“并存”：
+
+```sh
+systemctl enable --now unisoc-cpd.service
+```
+
 **切换所有权前必须先停掉旧的 AT 代理**，否则本程序会（按设计）拒绝启动：
 
 ```sh
 systemctl stop e5-mobile-data-watch e5-mobile-data e5-atd
 ```
 
-`units/unisoc-cpd-soak.service` 里已经用 `Conflicts=` 声明了这三个单元，但手动切换时要记得它们。
+`units/unisoc-cpd-soak.service` 和 `units/unisoc-cpd.service` 里都用 `Conflicts=`
+声明了这三个单元，但手动切换时要记得它们。
 
 ## 10. 当前状态（不夸大）
 
 | 项目 | 状态 |
 |---|---|
-| 核心（channel / at / telemetry / profile / CLI） | 已实现，66 个测试通过 |
+| 核心（channel / at / telemetry / profile / CLI） | 已实现，98 个测试通过 |
 | `profile-check`（A12 门禁） | 通过（两个 profile，核心无平台名） |
+| URC 解码（契约 §9.2） | 已实现并测试；`+ECIND:`/`+CMT:`/`+CDS:` 有意保持原样，不解码就不假装解码 |
+| **G2 控制面（`serve`）** | 代码与离线测试就绪：常驻独占两条通道、URC 事件、socket 上的能力请求、空闲探活、`state`（含 `last_ok_age_s`）。**未上真机**——还没当过 `/dev/stty_nr1` 的主人 |
 | aarch64 构建 | 静态 `aarch64-unknown-linux-musl`，`tools/build-aarch64.sh` 可复现 |
 | **真机只读验证** | ✅ 已做：`diag spools`（8 个节点，全部 `char`）、`diag mailbox`、`diag asserts`（0 次 assert）、`nv list`（7 个分区）。每次运行的摘要都显示 `at.commands: 0`、`channels.cmd.opens: 0`，即**全程没有打开过 AT 通道** |
-| **真机接管 AT** | ❌ **尚未发生**。没有任何 profile 是 `verified`；守护进程还没当过 `/dev/stty_nr1` 的主人，没跑过浸泡 |
+| **真机接管 AT** | ✅ **Android 侧已做**（2026-09-20）：`stop vendor.ril-daemon` 后守护进程成为两条通道的唯一读者，`link`/`sim`/`band`/`serve`+socket 全部实测通过，0 次 CP assert，URC 解码 50/50；交接规程与栈冷启动要求见 FINDINGS §25。Linux 侧还没在开机时当过主人，没跑过浸泡，profile 仍 `verified = false` |
 | log/dump spool 排空、`stime_ch` | ❌ 未实现（W1 遗留） |
 | 语音 CS | ❌ `voice.supported = false`：本平台还没有 UCM/语音路由 |
 
