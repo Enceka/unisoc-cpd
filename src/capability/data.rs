@@ -204,8 +204,15 @@ impl Capability for Data {
                         };
                         let prefix = c5.mask.map(mask_to_prefix).unwrap_or(8);
                         let (_, _) = run("ip", &["link", "set", iface, "up"]);
-                        // the sipa driver hands up wrong hardware checksums
-                        let _ = run("ethtool", &["-K", iface, "rx", "off"]);
+                        // the sipa driver hands up wrong hardware checksums, and
+                        // turning only rx off is not enough: with tx-checksumming
+                        // (and its TSO/GSO children) still on, every packet the
+                        // bearer sends is dropped -- +CGCONTRDP looks perfect and
+                        // ping gets nothing.
+                        let _ = run(
+                            "ethtool",
+                            &["-K", iface, "rx", "off", "tx", "off", "tso", "off", "gso", "off"],
+                        );
                         let _ = run("ip", &["addr", "flush", "dev", iface]);
                         let (aok, aerr) = run(
                             "ip",

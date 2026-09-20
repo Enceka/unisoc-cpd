@@ -102,7 +102,7 @@ impl Capability for Cfun {
     }
 
     fn summary(&self) -> &'static str {
-        "radio power (AT+CFUN?, and this family's AT+SFUN=2/4)"
+        "radio power (AT+CFUN?; this family's AT+SFUN=2/4; 'cold' is the CFUN=0 -> SFUN cold cycle)"
     }
 
     fn run(&self, ctx: &mut Context, args: &[String]) -> Result<Outcome> {
@@ -137,6 +137,24 @@ impl Capability for Cfun {
                     .map(|l| l.contains('1'))
                     .unwrap_or(false);
             }
+            // FINDINGS 25.3: a RIL shutdown parks the CP at +CFUN: 0, and there the
+            // SFUN pair alone is not stack bring-up -- +CFUN: 1 comes back with no
+            // registration.  The cold cycle is the documented recovery for that
+            // state, and the one to run when `on` leaves +CFUN: 1 but no RF.
+            "cold" => {
+                let r = session.command("AT+CFUN=0", Duration::from_secs(15), &[], 0);
+                emit(&mut out, "AT+CFUN=0", &r);
+                for cmd in ["AT+SFUN=2", "AT+SFUN=4"] {
+                    let r = session.command(cmd, Duration::from_secs(25), &[], 0);
+                    emit(&mut out, cmd, &r);
+                }
+                let r = session.command("AT+CFUN?", Duration::from_secs(5), &[], 0);
+                emit(&mut out, "AT+CFUN?", &r);
+                ok = r
+                    .first_with_prefix("+CFUN:")
+                    .map(|l| l.contains('1'))
+                    .unwrap_or(false);
+            }
             "reset" => {
                 let r = session.command("AT+SFUN=4", Duration::from_secs(25), &[], 0);
                 emit(&mut out, "AT+SFUN=4", &r);
@@ -151,7 +169,7 @@ impl Capability for Cfun {
                 ctx.note("SFUN=5/3 leaves this modem's SIM undetected until a reboot".to_string());
                 ok = false;
             }
-            other => anyhow::bail!("cfun: unknown action {other:?} (status|on|off|reset|cycling)"),
+            other => anyhow::bail!("cfun: unknown action {other:?} (status|on|off|cold|reset|cycling)"),
         }
         Ok(outcome(out, ok))
     }

@@ -9,6 +9,7 @@
 //! daemon does *to* the modem, it is the daemon holding the channel so that
 //! every other verb can be asked for by name (`core/capability/serve.rs`).
 
+pub mod at;
 pub mod control;
 pub mod data;
 pub mod imei;
@@ -69,6 +70,7 @@ pub trait Capability {
 
 pub fn find(name: &str) -> Option<Box<dyn Capability>> {
     let all: Vec<Box<dyn Capability>> = vec![
+        Box::new(at::At),
         Box::new(link::Link),
         Box::new(control::Sim),
         Box::new(control::Cfun),
@@ -92,8 +94,8 @@ pub fn find(name: &str) -> Option<Box<dyn Capability>> {
 
 pub fn catalogue() -> Vec<(&'static str, &'static str, bool)> {
     let names = [
-        "link", "sim", "cfun", "register", "signal", "operator", "band", "nr", "ims", "sms",
-        "ussd", "call", "data", "imei", "nv", "diag", "serve",
+        "at", "link", "sim", "cfun", "register", "signal", "operator", "band", "nr", "ims",
+        "sms", "ussd", "call", "data", "imei", "nv", "diag", "serve",
     ];
     names
         .iter()
