@@ -140,8 +140,10 @@ fn call_dials_and_hangs_up_signaling_only_without_an_audio_route() {
     assert!(stdout.contains("ATH"), "stdout:\n{stdout}");
 }
 
-/// The measurement tree is probed, and what it answers is read: this is the
-/// serving cell and the neighbour list the signal panel shows.
+/// The measurement tree is probed, and what it answers is read.  The rig
+/// answers in the shape the device was measured using: **no `+SPENGMD:`
+/// header**, an all-zero LTE serving line when the UE is on NR SA, twelve-field
+/// LTE neighbour records and eight column-wise NR neighbour columns.
 #[test]
 fn serving_and_neighbours_come_out_of_the_measurement_tree() {
     let r = rig("radio-serving");
@@ -151,21 +153,31 @@ fn serving_and_neighbours_come_out_of_the_measurement_tree() {
     assert!(out.status.success(), "stdout:\n{stdout}");
     assert!(stdout.contains("AT+SPENGMD=0,6,0"), "stdout:\n{stdout}");
     assert!(stdout.contains("AT+SPENGMD=0,14,1"), "stdout:\n{stdout}");
-    assert!(stdout.contains("serving_lte_earfcn: 1650"), "stdout:\n{stdout}");
-    assert!(stdout.contains("serving_lte_rsrp: -85.0"), "stdout:\n{stdout}");
-    assert!(stdout.contains("serving_lte_bandwidth: 20M"), "stdout:\n{stdout}");
+    // The headerless NR serving cell is read...
+    assert!(stdout.contains("serving_nr_band: 78"), "stdout:\n{stdout}");
+    assert!(stdout.contains("serving_nr_earfcn: 627264"), "stdout:\n{stdout}");
     assert!(stdout.contains("serving_nr_pci: 5"), "stdout:\n{stdout}");
-    assert!(stdout.contains("serving_nr_sinr: -15.0"), "stdout:\n{stdout}");
+    assert!(stdout.contains("serving_nr_rsrp: -95.0"), "stdout:\n{stdout}");
+    assert!(stdout.contains("serving_nr_rsrq: -12.0"), "stdout:\n{stdout}");
+    // SINR is not claimed from the serving record: the field is unresolved,
+    // and CESQ is what measures it.
+    assert!(stdout.contains("serving_nr_sinr: -"), "stdout:\n{stdout}");
+    assert!(stdout.contains("serving_nr_bandwidth: 100"), "stdout:\n{stdout}");
+    assert!(stdout.contains("serving_nr_cell: 4321"), "stdout:\n{stdout}");
+    // ...and an all-zero LTE serving line is a gap, not a cell at zero.
+    assert!(stdout.contains("serving_lte: not reported"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("serving_lte_pci"), "stdout:\n{stdout}");
 
     let out = run(&r.dir, "signal", &["neighbors"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "stdout:\n{stdout}");
     assert!(stdout.contains("AT+SPENGMD=0,6,6"), "stdout:\n{stdout}");
     assert!(stdout.contains("AT+SPENGMD=0,14,2"), "stdout:\n{stdout}");
-    assert!(stdout.contains("neighbors_lte: 2"), "stdout:\n{stdout}");
+    // Read and empty is a zero; read and parsed is the list.
+    assert!(stdout.contains("neighbors_lte: 0"), "stdout:\n{stdout}");
     assert!(stdout.contains("neighbors_nr: 2"), "stdout:\n{stdout}");
     assert!(
-        stdout.contains("neighbor: NR,band=78,earfcn=627264,pci=5"),
+        stdout.contains("neighbor: NR,band=78,earfcn=627264,pci=5,rsrp=-95.0,rsrq=-12.0,sinr=1.0"),
         "stdout:\n{stdout}"
     );
 }

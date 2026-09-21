@@ -506,12 +506,26 @@ fn api_metrics(socket: &Path) -> Value {
     let lte = serving_of("lte");
     let nr = serving_of("nr");
     let unscanned = |value: &Value| value.get("earfcn").map(|v| v.is_null()).unwrap_or(true);
+    let serving_field = |value: &Value, key: &str| value.get(key).and_then(|v| v.as_f64());
+
+    // Measured on the device, camped on NR SA: `+CESQ` answers "not reported"
+    // for RSRP and RSRQ (every field 255, only the SS-SINR present), while the
+    // serving-cell query carries both.  So the panel falls back to the serving
+    // cell -- and says so, because the two are not the same measurement.
+    let from_cesq = number("RSRP");
+    let rsrp = from_cesq
+        .or_else(|| serving_field(&nr, "rsrp_dbm"))
+        .or_else(|| serving_field(&lte, "rsrp_dbm"));
+    let rsrq = number("RSRQ")
+        .or_else(|| serving_field(&nr, "rsrq_db"))
+        .or_else(|| serving_field(&lte, "rsrq_db"));
 
     json!({
         "rssi_dbm": csq_rssi(&status_out),
-        "rsrp_dbm": number("RSRP"),
-        "rsrq_db": number("RSRQ"),
-        "sinr_db": number("SINR"),
+        "rsrp_dbm": rsrp,
+        "rsrp_source": rsrp.map(|_| if from_cesq.is_some() { "cesq" } else { "serving" }),
+        "rsrq_db": rsrq,
+        "sinr_db": number("SINR").or_else(|| serving_field(&nr, "sinr_db")),
         "lte": lte,
         "nr": nr,
         // "the CP did not report it" and "it reported nothing in range" are
@@ -585,7 +599,7 @@ fn api_info(socket: &Path) -> Value {
         "profile": summary(&out, "profile"),
         "model": summary(&out, "model"),
         "firmware": summary(&out, "firmware"),
-        "revision": summary(&out, "revision"),
+        "hardware": summary(&out, "hardware"),
         "status": answer.get("status"),
         "error": answer.get("error"),
     })
@@ -663,10 +677,15 @@ fn api_network(socket: &Path) -> Value {
     };
 
     let numeric = summary(&ops_out, "operator_numeric");
-    let name = numeric
-        .as_deref()
-        .and_then(crate::capability::control::operator_name)
-        .map(|s| s.to_string());
+    // The CP's own name form when it answered with one; otherwise this build's
+    // MCC-MNC table, because a bare numeric is not what an operator field is
+    // for.  Neither is guessed at: an unknown code stays unknown.
+    let name = summary(&ops_out, "operator_name").or_else(|| {
+        numeric
+            .as_deref()
+            .and_then(crate::capability::control::operator_name)
+            .map(|s| s.to_string())
+    });
 
     json!({
         "operator_numeric": numeric,
@@ -957,7 +976,8 @@ function kv(label, value){
     ? '<span class="dim">未上报</span>' : esc(value))+'</div>'; }
 async function refreshInfo(){ try{ const d = await get('/api/info');
   document.getElementById('baseband').innerHTML =
-    kv('基带', (d.model||'—') + ' · ' + (d.firmware||'—') + ' · ' + (d.profile||'—')); }catch(e){} }
+    kv('基带', (d.model||'—') + ' · ' + (d.firmware||'—')
+      + (d.hardware ? ' · ' + d.hardware : '') + ' · ' + (d.profile||'—')); }catch(e){} }
 async function loadIdentity(){
   const el = document.getElementById('identity'); el.textContent = '读取中…';
   try{ const d = await get('/api/identity'); let h = '';
@@ -995,7 +1015,9 @@ async function loadMetrics(){
   el.textContent = '读取中…（要探测测量类 AT，可能几十秒）';
   try{ const d = await get('/api/metrics'); let h = '';
     h += kv('RSSI', d.rssi_dbm!=null ? d.rssi_dbm+' dBm' : null);
-    h += kv('RSRP', d.rsrp_dbm!=null ? d.rsrp_dbm+' dBm' : null);
+    h += kv('RSRP', d.rsrp_dbm!=null
+      ? d.rsrp_dbm+' dBm'+(d.rsrp_source==='serving' ? '（服务小区，CESQ 未上报）' : '')
+      : null);
     h += kv('RSRQ', d.rsrq_db!=null ? d.rsrq_db+' dB' : null);
     h += kv('SINR', d.sinr_db!=null ? d.sinr_db+' dB' : null);
     function cell(tag, s){

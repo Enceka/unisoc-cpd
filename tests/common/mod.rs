@@ -246,6 +246,12 @@ fn respond(
         "+CEMODE: 1\r\nOK\r\n".into()
     } else if upper.starts_with("AT+CEUS=") || upper.starts_with("AT+CEMODE=") {
         "OK\r\n".into()
+    } else if upper.starts_with("AT+COPS=3,") {
+        // The triple-format query the vendor RIL uses, and the one the daemon
+        // now asks: long name, short name, numeric with the AcT.  It has to
+        // come before the scan branch, which also contains a '?'.
+        "+COPS: 0,0,\"CHN-UNICOM\"\r\n+COPS: 0,1,\"UNICOM\"\r\n+COPS: 0,2,\"46001\",7\r\nOK\r\n"
+            .into()
     } else if upper.starts_with("AT+COPS=") && upper.contains('?') {
         "+COPS: (2,\"CHN-UNICOM\",\"UNICOM\",\"46001\",7),(1,\"CHN-MOBILE\",\"CMCC\",\"46000\",7)\r\nOK\r\n".into()
     } else if upper.starts_with("AT+COPS?") {
@@ -380,14 +386,21 @@ fn respond(
     } else if upper.starts_with("AT+SP5GCMDS") {
         "+SP5GCMDS: 0,0,1\r\nOK\r\n".into()
     } else if upper.starts_with("AT+SPENGMD=0,6,0") {
-        // Placeholder measurement, in the shape the parser is built for.
-        "+SPENGMD: 3-1650-88-+8500-+1000-0-0-5-0-0-12345-67890\r\nOK\r\n".into()
+        // What the device answers on NR SA: 65 dash-separated zeros, and **no
+        // `+SPENGMD:` header** -- the header's absence is the measured
+        // behaviour, and looking for one is what threw every real reading away.
+        vec!["0"; 65].join("-") + "\r\nOK\r\n"
     } else if upper.starts_with("AT+SPENGMD=0,14,1") {
-        "+SPENGMD: 78-627264-5-+9500-+1200-0-0-100-42-4321-0-0-0-0-0-+1500\r\nOK\r\n".into()
+        // An NR serving cell: band, EARFCN, PCI, RSRP, RSRQ, SINR, …, bandwidth,
+        // …, cell id -- headerless, negatives carried the way the CP carries
+        // them.  Placeholder values.
+        "78,0-627264,0-5,0--9500,0--1200,0--100,0-0,0-100,0-0,0-4321,0-0,0-0\r\nOK\r\n".into()
     } else if upper.starts_with("AT+SPENGMD=0,6,6") {
-        "+SPENGMD: 1650,88,+9500,+1200-3000,7,+8800,+900-0,0,0,0\r\nOK\r\n".into()
+        // No LTE neighbours: eight all-zero twelve-field records, as measured.
+        ["0,0,0,0,0,0,0,0,0,0,0,0"; 8].join("-") + "\r\nOK\r\n"
     } else if upper.starts_with("AT+SPENGMD=0,14,2") {
-        "+SPENGMD: 78,41-627264,650000-5,6-+9500,+8800-+1200,+900-100,120\r\nOK\r\n".into()
+        // Two NR neighbours, column-wise, eight columns (the helper reads six).
+        "78,41-627264,650000-5,6--9500,-8800--1200,-900-100,120-32,32-1,2\r\nOK\r\n".into()
     } else {        "ERROR\r\n".into()
     };
     let _ = w.write_all(body.as_bytes());

@@ -155,11 +155,12 @@ fn web_serves_the_page_and_the_daemons_state() {
         }
         if !metrics_ok {
             if let Some(body) = http_try(port, "/api/metrics") {
-                // The serving cell and one neighbour, out of the (placeholder)
-                // measurement the fake CP answers.
-                metrics_ok |= body.contains("\"earfcn\":1650")
-                    && body.contains("-85.0")
-                    && body.contains("627264");
+                // The serving cell and a neighbour, out of the (placeholder)
+                // measurement the fake CP answers -- headerless, which is how
+                // the device answers.
+                metrics_ok |= body.contains("\"earfcn\":627264")
+                    && body.contains("-95.0")
+                    && body.contains("\"neighbors_nr\":2");
             }
         }
         if !bands_ok {

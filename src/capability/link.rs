@@ -171,36 +171,33 @@ fn link_info(ctx: &mut Context) -> Result<Outcome> {
     let t = Duration::from_secs(8);
     let mut out = Vec::new();
 
+    // Measured on the device (2026-09-21): `AT+CGMM` answers one short line,
+    // `AT+CGMR` a five-line version block, and **`ATI` is not supported** at
+    // all (`+CME ERROR: 4`) -- so it is not asked, and the pass condition is
+    // the two commands that do answer.
     let model = session.command("AT+CGMM", t, &[], 0);
     let firmware = session.command("AT+CGMR", t, &[], 0);
-    let info = session.command("ATI", t, &[], 0);
-    for (cmd, reply) in [("AT+CGMM", &model), ("AT+CGMR", &firmware), ("ATI", &info)] {
+    for (cmd, reply) in [("AT+CGMM", &model), ("AT+CGMR", &firmware)] {
         emit(&mut out, cmd, reply);
     }
 
-    let value = |reply: &crate::at::Reply| -> String {
-        let lines: Vec<&str> = reply
-            .lines
-            .iter()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty())
-            .collect();
-        if lines.is_empty() {
-            "-".to_string()
-        } else {
-            lines.join(" | ")
-        }
-    };
     out.push(format!(
         "profile: {} ({})",
         ctx.profile.name, ctx.profile.generation
     ));
-    out.push(format!("model: {}", value(&model)));
-    out.push(format!("firmware: {}", value(&firmware)));
-    out.push(format!("revision: {}", value(&info)));
+    out.push(format!("model: {}", first_line(&model)));
+    // The whole version block is in the raw echo above; a status bar wants the
+    // one line that names the running firmware, and `HW` is worth its own
+    // field because it is what a profile is actually written against.
+    out.push(format!(
+        "firmware: {}",
+        labelled_line(&firmware, "BASE").unwrap_or_else(|| first_line(&firmware))
+    ));
+    out.push(format!(
+        "hardware: {}",
+        labelled_line(&firmware, "HW Version").unwrap_or_else(|| "-".to_string())
+    ));
 
-    // The two commands that name the CP are the pass condition; `ATI` is
-    // informational and some firmware answers ERROR to it.
     let ok = model.ok() && firmware.ok();
     if !ok {
         ctx.note("the CP did not answer its own identity commands".to_string());
@@ -210,4 +207,31 @@ fn link_info(ctx: &mut Context) -> Result<Outcome> {
     } else {
         Outcome::fail(out)
     })
+}
+
+/// The first non-empty line of a reply, or `-`.
+fn first_line(reply: &crate::at::Reply) -> String {
+    reply
+        .lines
+        .iter()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("-")
+        .to_string()
+}
+
+/// The value of the `Label: value` line with that label, case-insensitively.
+/// `AT+CGMR`'s block is spelled `Platform Version: …`, `Project Version: …`,
+/// `BASE  Version: …` (two spaces), `HW Version: …`, so the match is on the
+/// leading word, not on the whole label text.
+fn labelled_line(reply: &crate::at::Reply, label: &str) -> Option<String> {
+    let label = label.to_ascii_uppercase();
+    reply
+        .lines
+        .iter()
+        .map(|l| l.trim())
+        .find(|l| l.to_ascii_uppercase().starts_with(&label))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }

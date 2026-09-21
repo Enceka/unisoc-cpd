@@ -158,6 +158,21 @@ fn cops_fields(reply: &crate::at::Reply) -> Option<Vec<String>> {
     Some(split_fields(line.split_once(':')?.1))
 }
 
+/// Field `field` of the `which`-th `+COPS:` line.  The triple-format query
+/// answers three lines in a row — long name, short name, numeric plus AcT —
+/// so a single reply carries all of it and the index picks the line.
+fn cops_field(lines: &[String], which: usize, field: usize) -> Option<String> {
+    lines
+        .iter()
+        .filter(|l| l.trim_start().starts_with("+COPS:"))
+        .nth(which)
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, body)| split_fields(body))
+        .and_then(|fields| fields.get(field).cloned())
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// The operator's name for an MCC-MNC, where this build knows one.  The
 /// mapping is public numbering-plan data, not a device identifier; an unknown
 /// code is reported as unknown rather than guessed at.
@@ -526,40 +541,50 @@ fn signal_neighbors(ctx: &mut Context) -> Result<Outcome> {
     let lte_cells = crate::unisoc_at::parse_lte_neighbors(&lte.lines);
     let nr_cells = crate::unisoc_at::parse_nr_neighbors(&nr.lines);
 
-    for (rat, cells, answered) in [("LTE", &lte_cells, lte.ok()), ("NR", &nr_cells, nr.ok())] {
-        for cell in cells {
-            out.push(format!(
-                "neighbor: {rat},band={},earfcn={},pci={},rsrp={:.1},rsrq={:.1}{}",
-                shown_text(&cell.band),
-                cell.earfcn,
-                cell.pci,
-                cell.rsrp,
-                cell.rsrq,
-                cell.sinr
-                    .map(|s| format!(",sinr={s:.1}"))
-                    .unwrap_or_default()
-            ));
-        }
-        out.push(format!(
-            "neighbors_{}: {}",
-            rat.to_ascii_lowercase(),
-            if answered {
-                cells.len().to_string()
-            } else {
-                "not reported".to_string()
+    let mut read_any = false;
+    for (rat, cells, reply) in [("LTE", &lte_cells, &lte), ("NR", &nr_cells, &nr)] {
+        match cells {
+            // A reading means the answer was understood -- the cells it
+            // carried, or none at all if there is nothing in range.  An
+            // answer nobody could read stays `not reported` instead of being
+            // printed as a zero, which is the difference the parsers' Option
+            // exists to preserve.
+            Some(cells) if reply.ok() => {
+                read_any = true;
+                for cell in cells {
+                    out.push(format!(
+                        "neighbor: {rat},band={},earfcn={},pci={},rsrp={:.1},rsrq={:.1}{}",
+                        shown_text(&cell.band),
+                        cell.earfcn,
+                        cell.pci,
+                        cell.rsrp,
+                        cell.rsrq,
+                        cell.sinr
+                            .map(|s| format!(",sinr={s:.1}"))
+                            .unwrap_or_default()
+                    ));
+                }
+                out.push(format!(
+                    "neighbors_{}: {}",
+                    rat.to_ascii_lowercase(),
+                    cells.len()
+                ));
             }
-        ));
+            _ => out.push(format!(
+                "neighbors_{}: not reported",
+                rat.to_ascii_lowercase()
+            )),
+        }
     }
 
-    let answered = lte.ok() || nr.ok();
-    if !answered {
+    if !read_any {
         ctx.note(
             "the CP does not answer the SPENGMD neighbour queries: it does not report \
              neighbours (or not in a shape this build knows)"
                 .to_string(),
         );
     }
-    Ok(if answered {
+    Ok(if read_any {
         Outcome::pass(out)
     } else {
         Outcome::fail(out)
@@ -588,22 +613,43 @@ impl Capability for Operator {
 
         match action {
             "status" => {
-                let r = session.command("AT+COPS?", Duration::from_secs(8), &[], 0);
-                emit(&mut out, "AT+COPS?", &r);
-                // `+COPS: <mode>,<format>,"<oper>",<act>` — the numeric code
-                // and the AcT are what a client needs; the human-readable
-                // operator name is a lookup on the code, not another query.
-                let fields = cops_fields(&r);
-                let field = |i: usize| -> String {
-                    fields
-                        .as_ref()
-                        .and_then(|f| f.get(i))
-                        .map(|v| v.trim().trim_matches('"').to_string())
-                        .filter(|v| !v.is_empty())
-                        .unwrap_or_else(|| "-".to_string())
+                // `AT+COPS?` on its own answers only the mode on this CP --
+                // measured on the device: `+COPS: 0`, with no operator and no
+                // AcT, which is why the operator panel had nothing to show.
+                // The vendor RIL asks for all three name formats in one
+                // command; the same command is asked here.
+                let cmd = "AT+COPS=3,0;+COPS?;+COPS=3,1;+COPS?;+COPS=3,2;+COPS?";
+                let r = session.command(cmd, Duration::from_secs(10), &[], 0);
+                emit(&mut out, cmd, &r);
+                let long = cops_field(&r.lines, 0, 2);
+                let short = cops_field(&r.lines, 1, 2);
+                let numeric = cops_field(&r.lines, 2, 2);
+                let act = cops_field(&r.lines, 2, 3);
+
+                // A firmware that answers the plain query with everything still
+                // works: fall back to the single line for the code and the AcT
+                // (the name form is not in it, so the name stays unknown rather
+                // than being filled in with the number).
+                let (name, numeric, act) = if numeric.is_some() {
+                    (long.or(short), numeric, act)
+                } else {
+                    let plain = session.command("AT+COPS?", Duration::from_secs(8), &[], 0);
+                    emit(&mut out, "AT+COPS?", &plain);
+                    let fields = cops_fields(&plain);
+                    let field = |i: usize| {
+                        fields
+                            .as_ref()
+                            .and_then(|f| f.get(i))
+                            .map(|v| v.trim().trim_matches('"').to_string())
+                            .filter(|v| !v.is_empty())
+                    };
+                    (None, field(2), field(3))
                 };
-                out.push(format!("operator_numeric: {}", field(2)));
-                out.push(format!("operator_act: {}", field(3)));
+
+                let or_dash = |v: Option<String>| v.unwrap_or_else(|| "-".to_string());
+                out.push(format!("operator_numeric: {}", or_dash(numeric)));
+                out.push(format!("operator_name: {}", or_dash(name)));
+                out.push(format!("operator_act: {}", or_dash(act)));
                 ok = r.ok();
             }
             "scan" => {

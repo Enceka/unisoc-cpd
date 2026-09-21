@@ -328,25 +328,55 @@ pub struct Neighbor {
     pub sinr: Option<f64>,
 }
 
+/// The payload of an `AT+SPENGMD` answer.
+///
+/// **Measured on the device, 2026-09-21.**  The CP answers with the payload on
+/// a line of its own and **no `+SPENGMD:` header at all**:
+///
+/// ```text
+/// at> AT+SPENGMD=0,14,1
+/// 78,0-627264,0-5,0--9500,0--1200,0--100,0-0,0-100,0-...
+/// OK
+/// ```
+///
+/// (The values above are placeholders in the measured shape; the real readings
+/// are the device's own network data and stay out of the tree.)
+///
+/// An earlier version of this parser looked for the word `SPENGMD` in the
+/// answer, which meant every real reading was discarded and reported as "not
+/// reported" -- a gap where there was data, which is the one failure mode this
+/// module exists to prevent.  So the header is stripped when it is present and
+/// its absence is not an error.
+fn engmd_payload(lines: &[String]) -> Option<String> {
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let body = match line.to_ascii_uppercase().find("SPENGMD") {
+            Some(at) => line[at + "SPENGMD".len()..].trim_start_matches(':').trim(),
+            None => line,
+        };
+        // A measurement answer is separators and numbers; anything else on the
+        // line is not this payload.
+        if body.contains('-') || body.contains(',') {
+            return Some(body.to_string());
+        }
+    }
+    None
+}
+
 /// The groups of an `AT+SPENGMD` answer.
 ///
-/// The shape is the one the Android-side helper for this generation reads: the
-/// first payload line, with the mangled minus signs restored (`,-` -> `,+`,
-/// `--` -> `-+`), split on `-` into groups that are themselves comma lists.
-///
-/// **This is a hypothesis, not a measurement.**  It is the shape the helper's
-/// own indexing implies, and it has not been captured on this handset yet;
-/// that is why every reading below is optional and a shape that does not fit
-/// produces "not reported" rather than a number (W5).
+/// The shape is the one the Android-side helper for this generation reads and
+/// the one the device was measured emitting: the payload line, with the
+/// mangled minus signs restored (`,-` -> `,+`, `--` -> `-+`), split on `-` into
+/// groups that are themselves comma lists.  A group is therefore one field in
+/// the dash reading and a column list in the other; `engmd_field` takes its
+/// first token, which is the same thing for a scalar.
 fn engmd_groups(lines: &[String]) -> Option<Vec<Vec<String>>> {
-    let line = lines
-        .iter()
-        .find(|l| l.to_ascii_uppercase().contains("SPENGMD"))?;
-    let payload = line
-        .split_once(':')
-        .map(|(_, rest)| rest)
-        .unwrap_or(line.as_str());
-    let payload = payload.split("OK").next().unwrap_or(payload);
+    let payload = engmd_payload(lines)?;
+    let payload = payload.split("OK").next().unwrap_or(payload.as_str());
     let fixed = payload.replace(",-", ",+").replace("--", "-+");
     let groups: Vec<Vec<String>> = fixed
         .split('-')
@@ -443,7 +473,13 @@ pub fn parse_nr_serving(lines: &[String]) -> Option<Serving> {
         pci: number_i64(engmd_field(&fields, 2)).and_then(|v| u32::try_from(v).ok()),
         rsrp: hundredths(engmd_field(&fields, 3)),
         rsrq: hundredths(engmd_field(&fields, 4)),
-        sinr: hundredths(engmd_field(&fields, 15)),
+        // No SINR.  The Android helper reads one at group 15 and the measured
+        // answer has `1` there (0.01 dB, which is not a signal); the plausible
+        // value sits at group 5 (-1.20) but nothing corroborates it, and the
+        // SS-SINR `+CESQ` reports is a real measurement of the same thing.  So
+        // this field stays empty rather than carrying a guess -- the caller
+        // takes SINR from CESQ.
+        sinr: None,
         // The NR width field's units are not measured on this generation, so
         // it is carried verbatim rather than dressed up as a bandwidth.
         bandwidth: engmd_field(&fields, 7),
@@ -452,44 +488,65 @@ pub fn parse_nr_serving(lines: &[String]) -> Option<Serving> {
     serving.is_cell().then_some(serving)
 }
 
-/// `AT+SPENGMD=0,6,6`: one `earfcn,pci,rsrp,rsrq` record per neighbour, as
-/// groups.  The all-zero record the CP pads the list with is dropped, and so
-/// is any record too short to be a cell.
-pub fn parse_lte_neighbors(lines: &[String]) -> Vec<Neighbor> {
-    let Some(groups) = engmd_groups(lines) else {
-        return Vec::new();
-    };
-    groups
-        .iter()
-        .filter_map(|group| {
-            if group.len() < 4 {
-                return None;
-            }
-            let earfcn = group[0].parse::<u32>().ok()?;
-            let pci = group[1].parse::<u32>().ok()?;
-            let rsrp = hundredths(Some(group[2].replace('+', "-")))?;
-            let rsrq = hundredths(Some(group[3].replace('+', "-")))?;
-            if earfcn == 0 && pci == 0 && rsrp == 0.0 && rsrq == 0.0 {
-                return None;
-            }
-            Some(Neighbor {
-                band: lte_band_from_earfcn(earfcn).map(|b| b.to_string()),
-                earfcn,
-                pci,
-                rsrp,
-                rsrq,
-                sinr: None,
+/// `AT+SPENGMD=0,6,6`: one record per neighbour.
+///
+/// Measured on the device (2026-09-21): one group per record, twelve
+/// comma-separated fields per record, of which the helper this parser follows
+/// reads the first four (`earfcn,pci,rsrp,rsrq`).
+///
+/// `None` is "the answer was not readable"; `Some(empty)` is "read, and there
+/// is nothing in range".  Those are different facts and the caller reports them
+/// with different words -- an empty list must never be printed for an answer
+/// nobody could read.
+pub fn parse_lte_neighbors(lines: &[String]) -> Option<Vec<Neighbor>> {
+    let groups = engmd_groups(lines)?;
+    let records: Vec<&Vec<String>> = groups.iter().filter(|group| group.len() >= 4).collect();
+    if records.is_empty() {
+        return None;
+    }
+    Some(
+        records
+            .iter()
+            .filter_map(|group| {
+                let earfcn = group[0].parse::<u32>().ok()?;
+                let pci = group[1].parse::<u32>().ok()?;
+                let rsrp = hundredths(Some(group[2].replace('+', "-")))?;
+                let rsrq = hundredths(Some(group[3].replace('+', "-")))?;
+                if earfcn == 0 && pci == 0 && rsrp == 0.0 && rsrq == 0.0 {
+                    return None;
+                }
+                Some(Neighbor {
+                    band: lte_band_from_earfcn(earfcn).map(|b| b.to_string()),
+                    earfcn,
+                    pci,
+                    rsrp,
+                    rsrq,
+                    sinr: None,
+                })
             })
-        })
-        .collect()
+            .collect(),
+    )
 }
 
 /// `AT+SPENGMD=0,14,2`: the NR neighbour list arrives column-wise — one group
 /// per field, every group a comma list of the same length.
-pub fn parse_nr_neighbors(lines: &[String]) -> Vec<Neighbor> {
-    let Some(groups) = engmd_groups(lines) else {
-        return Vec::new();
-    };
+///
+/// Measured on the device (2026-09-21), camped on NR SA:
+///
+/// ```text
+/// 78,41-627264,650000-5,6-+9500,+8800-+1200,+900-100,120-32,32-1,2
+/// ```
+///
+/// (Placeholder values in the measured shape.)
+///
+/// which is band, ARFCN, PCI, RSRP, RSRQ, SINR -- the six columns the Android
+/// helper reads -- followed by two more this parser ignores.
+pub fn parse_nr_neighbors(lines: &[String]) -> Option<Vec<Neighbor>> {
+    let groups = engmd_groups(lines)?;
+    if groups.len() < 6 {
+        // Fewer than six groups cannot be the column layout; do not guess.
+        return None;
+    }
     let column = |i: usize| -> Vec<String> { groups.get(i).cloned().unwrap_or_default() };
     let (bands, arfcns, pcis, rsrps, rsrqs, sinrs) = (
         column(0),
@@ -504,25 +561,27 @@ pub fn parse_nr_neighbors(lines: &[String]) -> Vec<Neighbor> {
         .map(|c| c.len())
         .min()
         .unwrap_or(0);
-    (0..count)
-        .filter_map(|i| {
-            let earfcn = arfcns[i].parse::<u32>().ok()?;
-            let pci = pcis[i].parse::<u32>().ok()?;
-            let rsrp = hundredths(Some(rsrps[i].replace('+', "-")))?;
-            let rsrq = hundredths(Some(rsrqs[i].replace('+', "-")))?;
-            if earfcn == 0 && pci == 0 && rsrp == 0.0 && rsrq == 0.0 {
-                return None;
-            }
-            Some(Neighbor {
-                band: Some(bands[i].replace('+', "-")).filter(|b| !b.is_empty()),
-                earfcn,
-                pci,
-                rsrp,
-                rsrq,
-                sinr: hundredths(Some(sinrs[i].replace('+', "-"))),
+    Some(
+        (0..count)
+            .filter_map(|i| {
+                let earfcn = arfcns[i].parse::<u32>().ok()?;
+                let pci = pcis[i].parse::<u32>().ok()?;
+                let rsrp = hundredths(Some(rsrps[i].replace('+', "-")))?;
+                let rsrq = hundredths(Some(rsrqs[i].replace('+', "-")))?;
+                if earfcn == 0 && pci == 0 && rsrp == 0.0 && rsrq == 0.0 {
+                    return None;
+                }
+                Some(Neighbor {
+                    band: Some(bands[i].replace('+', "-")).filter(|b| !b.is_empty()),
+                    earfcn,
+                    pci,
+                    rsrp,
+                    rsrq,
+                    sinr: hundredths(Some(sinrs[i].replace('+', "-"))),
+                })
             })
-        })
-        .collect()
+            .collect(),
+    )
 }
 
 /// The LTE band an EARFCN belongs to, by the 36.101 ranges.  A frequency the
@@ -690,11 +749,11 @@ mod tests {
 
 /// The `AT+SPENGMD` readings.
 ///
-/// These tests pin the *hypothesis* the parser is built on -- the reading the
-/// Android-side helper for this generation implies -- and not a measurement on
-/// this handset: no answer from this CP has been captured yet, which is why
-/// every one of these functions is allowed to return "nothing read".  The
-/// samples below are constructed to that hypothesis, with placeholder values.
+/// The samples below are written to the shape the device was measured sending
+/// (2026-09-21), with placeholder values: **no `+SPENGMD:` header**, `-`
+/// between groups, a comma list inside a group, and a negative value carried
+/// as `+` or as `--`.  The first test is the regression for the bug that made
+/// every real reading look like a gap.
 #[cfg(test)]
 mod engmd_tests {
     use super::*;
@@ -703,9 +762,32 @@ mod engmd_tests {
         list.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Measured on the device as
+    /// `78,0-627264,0-5,0--9500,0--1200,0--100,0-0,0-100,0-…`: a bare payload
+    /// with no header at all.
     #[test]
-    fn serving_reads_the_dash_form() {
-        // one field per group
+    fn serving_reads_the_headerless_answer_the_device_sends() {
+        let answer = lines(&[
+            "78,0-627264,0-5,0--9500,0--1200,0--100,0-0,0-100,0-0,0-4321,0-0,0-0",
+            "OK",
+        ]);
+        let s = parse_nr_serving(&answer).expect("a cell");
+        assert_eq!(s.band.as_deref(), Some("78"));
+        assert_eq!(s.earfcn, Some(627264));
+        assert_eq!(s.pci, Some(5));
+        assert_eq!(s.rsrp, Some(-95.0));
+        assert_eq!(s.rsrq, Some(-12.0));
+        assert_eq!(
+            s.sinr, None,
+            "the serving record's SINR field is unresolved: do not claim one"
+        );
+        assert_eq!(s.bandwidth.as_deref(), Some("100"));
+        assert_eq!(s.cell.as_deref(), Some("4321"));
+    }
+
+    /// The header is stripped when a firmware does send one.
+    #[test]
+    fn the_header_is_stripped_when_there_is_one() {
         let answer = lines(&["+SPENGMD: 3-1650-88-+8500-+1000-0-0-5-0-0-12345-67890"]);
         let s = parse_lte_serving(&answer).expect("a cell");
         assert_eq!(s.band.as_deref(), Some("3"));
@@ -719,61 +801,52 @@ mod engmd_tests {
     }
 
     #[test]
-    fn serving_reads_the_flat_form() {
-        // the same fields as one comma list, which is the other shape the
-        // helper's indexing implies
-        let answer = lines(&["+SPENGMD: 3,1650,88,+8500,+1000,0,0,5,0,0,12345,67890", "OK"]);
-        let s = parse_lte_serving(&answer).expect("a cell");
-        assert_eq!(s.band.as_deref(), Some("3"));
-        assert_eq!(s.earfcn, Some(1650));
-        assert_eq!(s.pci, Some(88));
-        assert_eq!(s.rsrp, Some(-85.0));
-        assert_eq!(s.rsrq, Some(-10.0));
-        assert_eq!(s.bandwidth.as_deref(), Some("20M"));
-    }
-
-    #[test]
     fn nr_serving_reads_its_own_field_positions() {
-        let mut fields = vec!["78"; 16];
+        let mut fields = vec!["0"; 16];
+        fields[0] = "78";
         fields[1] = "627264";
         fields[2] = "5";
         fields[3] = "+9500";
         fields[4] = "+1200";
         fields[7] = "100";
         fields[9] = "4321";
-        fields[15] = "+1500";
-        let answer = lines(&[&format!("+SPENGMD: {}", fields.join("-"))]);
+        let answer = lines(&[&fields.join("-")]);
         let s = parse_nr_serving(&answer).expect("a cell");
         assert_eq!(s.band.as_deref(), Some("78"));
         assert_eq!(s.earfcn, Some(627264));
         assert_eq!(s.pci, Some(5));
         assert_eq!(s.rsrp, Some(-95.0));
         assert_eq!(s.rsrq, Some(-12.0));
-        assert_eq!(s.sinr, Some(-15.0));
         assert_eq!(s.bandwidth.as_deref(), Some("100"));
         assert_eq!(s.cell.as_deref(), Some("4321"));
+        assert_eq!(s.sinr, None, "SINR is not claimed from this record");
     }
 
-    /// The one that matters: an answer this build cannot read must read as
-    /// nothing, not as a cell at zero.
+    /// An answer this build cannot read must read as nothing, not as a cell at
+    /// zero.  Measured: the LTE serving query answers 65 dash-separated zeros
+    /// when the UE is on NR SA.
     #[test]
-    fn an_unreadable_answer_reads_as_nothing() {
+    fn an_all_zero_serving_answer_is_not_a_cell() {
+        let zeros = vec!["0"; 65].join("-");
+        assert_eq!(parse_lte_serving(&lines(&[&zeros])), None);
         assert_eq!(parse_lte_serving(&lines(&["ERROR"])), None);
-        assert_eq!(parse_lte_serving(&lines(&["+SPENGMD: 0,0"])), None);
-        assert_eq!(parse_lte_serving(&lines(&["+SPENGMD: 0-0-0-0-0"])), None);
+        assert_eq!(parse_lte_serving(&lines(&["0,0"])), None);
         assert_eq!(parse_lte_serving(&lines(&[])), None);
         assert_eq!(parse_nr_serving(&lines(&["ERROR"])), None);
-        // and a serving cell with EARFCN 0 is "not camped", not "band 1"
-        assert_eq!(parse_lte_serving(&lines(&["+SPENGMD: 1,0,88,+8500,+1000"])), None);
+        // a cell with EARFCN 0 is "not camped", not "band 1"
+        assert_eq!(parse_lte_serving(&lines(&["1,0,88,+8500,+1000"])), None);
     }
 
+    /// Measured: twelve comma-separated fields per record, one record per
+    /// group; the first four are the cell.
     #[test]
     fn lte_neighbours_are_one_record_per_group() {
         let answer = lines(&[
-            "+SPENGMD: 1650,88,+9500,+1200-3000,7,+8800,+900-0,0,0,0",
+            "1650,88,+9500,+1200,0,0,0,0,0,0,0,0-3000,7,+8800,+900,0,0,0,0,0,0,0,0\
+             -0,0,0,0,0,0,0,0,0,0,0,0",
             "OK",
         ]);
-        let cells = parse_lte_neighbors(&answer);
+        let cells = parse_lte_neighbors(&answer).expect("a reading");
         assert_eq!(cells.len(), 2, "the all-zero padding record is not a cell");
         assert_eq!(cells[0].band.as_deref(), Some("3"), "EARFCN 1650 is band 3");
         assert_eq!((cells[0].earfcn, cells[0].pci), (1650, 88));
@@ -783,12 +856,14 @@ mod engmd_tests {
         assert_eq!((cells[1].earfcn, cells[1].pci), (3000, 7));
     }
 
+    /// Measured: eight columns of five neighbours; the helper reads the first
+    /// six (band, ARFCN, PCI, RSRP, RSRQ, SINR).
     #[test]
     fn nr_neighbours_arrive_column_wise() {
         let answer = lines(&[
-            "+SPENGMD: 78,41-627264,650000-5,6-+9500,+8800-+1200,+900-100,120",
+            "78,41-627264,650000-5,6-+9500,+8800-+1200,+900-100,120-32,32-1,2",
         ]);
-        let cells = parse_nr_neighbors(&answer);
+        let cells = parse_nr_neighbors(&answer).expect("a reading");
         assert_eq!(cells.len(), 2);
         assert_eq!(cells[0].band.as_deref(), Some("78"));
         assert_eq!((cells[0].earfcn, cells[0].pci), (627264, 5));
@@ -796,12 +871,22 @@ mod engmd_tests {
         assert_eq!(cells[0].sinr, Some(1.0));
         assert_eq!(cells[1].band.as_deref(), Some("41"));
         assert_eq!((cells[1].earfcn, cells[1].pci), (650000, 6));
+        assert_eq!(cells[1].sinr, Some(1.2));
     }
 
+    /// "Nobody could read this" and "there is nothing in range" are different
+    /// facts, and the caller has to be able to tell them apart -- printing `0`
+    /// for an answer nobody read is what put a lie on the page.
     #[test]
-    fn no_neighbour_answer_is_an_empty_list() {
-        assert!(parse_lte_neighbors(&lines(&["ERROR"])).is_empty());
-        assert!(parse_nr_neighbors(&lines(&["+SPENGMD: 0-0-0-0-0-0"])).is_empty());
+    fn nothing_readable_is_none_and_nothing_in_range_is_empty() {
+        assert_eq!(parse_lte_neighbors(&lines(&["ERROR"])), None);
+        assert_eq!(parse_nr_neighbors(&lines(&["ERROR"])), None);
+        // fewer than six groups cannot be the NR column layout
+        assert_eq!(parse_nr_neighbors(&lines(&["78-41-5"])), None);
+        // read, and nothing in range: the measured all-zero answers
+        let lte_zeros = vec!["0,0,0,0,0,0,0,0,0,0,0,0"; 8].join("-");
+        assert_eq!(parse_lte_neighbors(&lines(&[&lte_zeros])), Some(Vec::new()));
+        assert_eq!(parse_nr_neighbors(&lines(&["0-0-0-0-0-0-0-0"])), Some(Vec::new()));
     }
 
     #[test]
