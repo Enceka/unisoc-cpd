@@ -25,6 +25,7 @@ unisoc-cpd / ucpd              一个二进制，一份 profile
 ├── src/at.rs                  AT 编解码、URC 分流、串行化、限速、超时
 ├── src/urc.rs                 URC 解码：控制面的主动一半（MT 短信/来电/注册/信号）
 ├── src/unisoc_at.rs           本代 CP 自己的 AT 扩展（频段/小区/5G/IMS）
+├── src/nat.rs                 承载的主机侧：规则/计划构建与只读回验（纯逻辑，全部可单测）
 ├── src/capability/            各项能力（见第 6 节）；serve 是常驻持有者
 ├── src/telemetry.rs           每次运行的 JSON 摘要
 ├── src/profile_check.rs       A12 可移植性门禁（做成命令）
@@ -40,7 +41,7 @@ unisoc-cpd / ucpd              一个二进制，一份 profile
 
 ```sh
 cargo build --release        # 主机
-cargo test                   # 119 个测试，不需要设备
+cargo test                   # 172 个测试，不需要设备
 ```
 
 测试跑在一个 **pty 上的伪 CP** 上。pty 是 SIPC tty 唯一诚实的替身：真 tty、两端、驱动按突发交付行。伪 CP 会在**每一条应答里插入一条 URC**，所以"URC 与应答分流"、"限速"、"超时"、`>` 续行提示符这四条路径**每条命令都会被走到**，而不是只在顺利路径上被走到。
@@ -102,6 +103,9 @@ unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock register status
 unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock state   # 守护进程状态（含 last_ok_age_s）
 unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock urc     # 最近解码出的 URC 事件
 unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock messages # 守护进程自己读到的短信（MT）
+
+# 浏览器界面（W7）同样是 socket 客户端，挂在守护进程上
+unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock web 0.0.0.0:7887
 ```
 
 `serve` 会自己对 `+CMTI:` 起反应：modem 一宣布新短信，守护进程就在两个请求
@@ -137,7 +141,7 @@ unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock messages # 守护进�
 | `sim` | SIM 在位与 PIN 状态 | 无参＝查询；`<PIN>`＝解锁；`identity`＝读 IMSI/ICCID（只读） |
 | `cfun` | 射频开关 | `status` `on` `off` `reset` `cycling`（后者会把 SIM 弄丢到重启，故返回失败并注明） |
 | `register` | 电路/分组注册、UE 用途设置 | `status`（含 `+C5GREG?`）`uemode` `data-centric` `voice-centric` |
-| `signal` | 信号质量，解码 RSRP/RSRQ/SINR | 无参 |
+| `signal` | 信号质量测量 | 无参；`+CSQ` 与 `+CESQ` 均解码，含 NR SA 扩展字段（SS-RSRP/RSRQ/SINR）。RSSI 按 CSQ 索引换算 dBm（`-113+2n`），索引 99＝未上报，如实呈现 |
 | `operator` | 选网 | `status` `scan` `auto` `manual <MCCMNC>` |
 | `band` | **频段锁定与小区锁定** | `status` `lock <lte\|nr> <频段...>` `unlock <lte\|nr\|all>` `cell-lock <lte\|nr> <频点> <PCI>` `cell-unlock <lte\|nr\|all>` |
 | `nr` | 5G SA/NSA 偏好与 5G 注册 | `status` `sa on` `sa off` |
@@ -145,11 +149,12 @@ unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock messages # 守护进�
 | `sms` | 短信 | `list` `read <序号>` `delete <序号\|all>` `send <号码> <正文>` |
 | `ussd` | USSD 会话 | `<业务码>`；无参＝取消会话 |
 | `call` | 语音 CS 控制 | `list` `dial <号码>` `answer` `hangup` `dtmf <按键>` |
-| `data` | PDP 与承载网卡 | `status` `up [APN]` `down` `apn` |
+| `data` | PDP 上下文与承载网卡 | `status` `up [APN]` `down` `apn` `contexts` `set-apn <APN>` `clear-apn` `save-apn <APN>` `nat on\|off\|status\|plan` |
 | `imei` | 设备身份（带护栏） | `read [--index N]` `probe` `write <串号> --index N --yes` |
 | `nv` | NV 视图与受护栏的备份/恢复 | `list` `hash <分区>` `[--head 字节数]` `backup [--dir D]` `restore <分区> <镜像> --yes` |
 | `diag` | 诊断 | `channels` `spools` `mailbox` `asserts` `urc` `all` |
-| `serve` | **G2**：常驻持有者，代替 Android 的 RIL 坐住通道 | `[--socket 路径]` `[--seconds N]`；客户端用 `--socket` + `<能力>`，或问它 `state` / `urc` |
+| `serve` | **G2**：常驻持有者，代替 Android 的 RIL 坐住通道 | `[--socket 路径]` `[--seconds N]`；客户端用 `--socket` + `<能力>`，或问它 `state` / `urc` / `messages` |
+| `web` | **W7**：浏览器界面，Material You，单文件、离线、零构建 | `web [地址:端口]`（须配 `--socket`）；收发短信、拨打/接听/挂断、实时 URC 流、来电横幅，以及高级信息 / APN / 信号指标 / 网络 / 锁频锁小区 / IMEI / 原始 AT 控制台面板 |
 
 写操作都会**回读校验**：`band lock` 写完立刻读回，没生效就不算通过——"调制解调器收下了命令"和"锁定真的生效了"是两回事。
 
@@ -169,9 +174,11 @@ unisoc-cpd --profile e5 --mode native band status
 unisoc-cpd --profile e5 --mode native band lock nr 78
 unisoc-cpd --profile e5 --mode native band unlock all
 
-# 承载
+# 承载（[data.nat].enabled 时，up 成功后自动装主机侧；down 自动撤）
 unisoc-cpd --profile e5 --mode native data up
 unisoc-cpd --profile e5 --mode native data status
+unisoc-cpd --profile e5 --mode native data nat status   # 把规则读回来验证，而不是声称装好了
+unisoc-cpd --profile e5 --mode native data nat plan     # 只打印将执行的命令，不执行
 
 # 厂商基线（做差分用）
 unisoc-cpd --profile e5 --mode vendor register
@@ -243,16 +250,18 @@ systemctl stop e5-mobile-data-watch e5-mobile-data e5-atd
 
 | 项目 | 状态 |
 |---|---|
-| 核心（channel / at / telemetry / profile / CLI） | 已实现，119 个测试通过 |
+| 核心（channel / at / telemetry / profile / CLI） | 已实现，172 个测试通过 |
 | `profile-check`（A12 门禁） | 通过（两个 profile，核心无平台名） |
 | URC 解码（契约 §9.2） | 已实现并测试；`+ECIND:`/`+CMT:`/`+CDS:` 有意保持原样，不解码就不假装解码 |
-| **G2 控制面（`serve`）** | 代码与离线测试就绪：常驻独占两条通道、URC 事件、socket 上的能力请求、空闲探活、`state`（含 `last_ok_age_s`）。**未上真机**——还没当过 `/dev/stty_nr1` 的主人 |
+| **G2 控制面（`serve`）** | 已实现并通过离线测试，**且已在真机常驻**（2026-09-20 起，Android 侧）：厂商 RIL 停止后独占两条通道，URC 解码 50/50，socket 客户端全部经它应答，0 次 CP assert，`state` 报告 `last_ok_age_s`。尚未完成：Linux 侧**开机即接管**（systemd 单元已在 `units/`，未在开机路径验证）、72 小时浸泡 |
 | aarch64 构建 | 静态 `aarch64-unknown-linux-musl`，`tools/build-aarch64.sh` 可复现 |
 | **真机只读验证** | ✅ 已做：`diag spools`（8 个节点，全部 `char`）、`diag mailbox`、`diag asserts`（0 次 assert）、`nv list`（7 个分区）。每次运行的摘要都显示 `at.commands: 0`、`channels.cmd.opens: 0`，即**全程没有打开过 AT 通道** |
 | **真机接管 AT** | ✅ **Android 侧已做**（2026-09-20）：`stop vendor.ril-daemon` 后守护进程成为两条通道的唯一读者，`link`/`sim`/`band`/`serve`+socket 全部实测通过，0 次 CP assert，URC 解码 50/50；交接规程与栈冷启动要求见 FINDINGS §1–§2。Linux 侧还没在开机时当过主人，没跑过浸泡，profile 仍 `verified = false` |
+| 信号测量 | `+CSQ` 与 `+CESQ` 均解码，含 NR SA 扩展字段（SS-RSRP/RSRQ/SINR）；RSSI 按 CSQ 索引换算 dBm，索引 99 如实报告为「未上报」而非编造数值 |
+| 承载的主机侧（`data nat`） | 已实现并**真机实测**（2026-09-21，Android 侧，见契约 §10）：`on` 一次装齐 8 步，重复执行不产生重复规则；`status` 把规则读回验证，输出 `nat: complete`；实测前两张路由表均无默认路由、`ping 223.5.5.5` 不通，实测后 2/2 回包。平台名（表/链/客户端网卡）全部来自 profile，客户端子网在运行时从网卡读取而非写死；Linux 侧自带的 `nat.nft` 不受影响 |
 | log/dump spool 排空、`stime_ch` | ❌ 未实现（W1 遗留） |
 | 语音 CS | 音频路由仍无（`voice.supported = false`）；信令一半已实测——`ims status` 读 `+CIREG`（IMS 注册门禁），`call` 纯信令拨/接/挂；**守护进程之下的第一通 VoLTE 来电已接通**（FINDINGS §14） |
-| W7 web 界面 | `web` 已落地：浏览器收发短信、接打电话、实时 URC 事件流、来电全屏横幅——只是 socket 客户端，绝不碰通道（`units/unisoc-cpd-web.service`） |
+| W7 web 界面 | 已落地并按 Material You 重新设计（单文件、离线、零构建）：收件箱与删除、发送短信、拨打/接听/挂断、实时 URC 事件流、来电横幅，以及高级信息、APN、信号指标、网络、锁频锁小区、IMEI 与原始 AT 控制台面板——本质是 socket 客户端，绝不持有通道（`units/unisoc-cpd-web.service`） |
 
 ## 11. AT 指令的来源
 
