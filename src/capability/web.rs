@@ -125,6 +125,39 @@ fn route(stream: &mut TcpStream, method: &str, path: &str, body: &str, socket: &
         ("GET", "/api/metrics") => respond_json(stream, &api_metrics(socket)),
         ("GET", "/api/identity") => respond_json(stream, &api_identity(socket)),
         ("GET", "/api/network") => respond_json(stream, &api_network(socket)),
+        ("GET", "/api/bands") => respond_json(stream, &api_band_state(socket)),
+        ("GET", "/api/cells") => respond_json(stream, &api_band_state(socket)),
+        ("POST", "/api/band-lock") => match band_request(body) {
+            Ok((rat, bands)) => {
+                let numbers: Vec<String> = bands.iter().map(|b| b.to_string()).collect();
+                let mut args: Vec<&str> = vec!["lock", rat.as_str()];
+                args.extend(numbers.iter().map(|s| s.as_str()));
+                respond_json(stream, &run_cap(socket, "band", &args));
+            }
+            Err(e) => respond_json(stream, &json!({ "ok": false, "status": "error", "error": e })),
+        },
+        ("POST", "/api/band-unlock") => {
+            // No RAT means "both", which is what the panel's single button does.
+            let rat = form_value(body, "rat").unwrap_or_default().trim().to_lowercase();
+            let rat = if rat.is_empty() { "all".to_string() } else { rat };
+            respond_json(stream, &run_cap(socket, "band", &["unlock", rat.as_str()]));
+        }
+        ("POST", "/api/cell-lock") => match cell_request(body) {
+            Ok((rat, freq, pci)) => {
+                let freq = freq.to_string();
+                let pci = pci.to_string();
+                respond_json(
+                    stream,
+                    &run_cap(socket, "band", &["cell-lock", rat.as_str(), &freq, &pci]),
+                );
+            }
+            Err(e) => respond_json(stream, &json!({ "ok": false, "status": "error", "error": e })),
+        },
+        ("POST", "/api/cell-unlock") => {
+            let rat = form_value(body, "rat").unwrap_or_default().trim().to_lowercase();
+            let rat = if rat.is_empty() { "all".to_string() } else { rat };
+            respond_json(stream, &run_cap(socket, "band", &["cell-unlock", rat.as_str()]));
+        }
         ("POST", "/api/at") => {
             // The console is a thin front-end over the daemon's own `at`
             // capability: the command is parsed and sent by the process that
@@ -267,6 +300,106 @@ fn neighbor_entry(line: &str) -> Value {
         map.insert(key.to_string(), value);
     }
     Value::Object(map)
+}
+
+/// The locked bands and cells, out of `band status`.
+///
+/// A lock is a `+SPLBAND`/`+SPFORCEFRQ` read-back, not a memory of what a
+/// button asked for: the daemon reads the CP back after every write, so what
+/// this returns is the modem's own answer.
+fn api_band_state(socket: &Path) -> Value {
+    let answer = run_cap(socket, "band", &["status"]);
+    let mut value = band_state_of(&output_lines(&answer));
+    value["status"] = answer.get("status").cloned().unwrap_or(Value::Null);
+    value["error"] = answer.get("error").cloned().unwrap_or(Value::Null);
+    value
+}
+
+/// The locked bands and cells, as the `band status` summary lines carry them.
+fn band_state_of(out: &[String]) -> Value {
+    let bands = |rat: &str| -> Vec<u32> {
+        summary(out, &format!("{rat}_bands"))
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|b| b.trim().parse::<u32>().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let cells = |rat: &str| -> Vec<Value> {
+        summary(out, &format!("{rat}_cells"))
+            .map(|v| {
+                v.split_whitespace()
+                    .filter_map(|pair| {
+                        let (freq, pci) = pair.split_once('/')?;
+                        Some(json!({
+                            "freq": freq.parse::<u32>().ok()?,
+                            "pci": pci.parse::<u32>().ok()?,
+                        }))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    json!({
+        "lte_bands": bands("lte"),
+        "nr_bands": bands("nr"),
+        "lte_cells": cells("lte"),
+        "nr_cells": cells("nr"),
+        "sprat": summary(out, "sprat"),
+    })
+}
+
+/// Comma/space separated band numbers, or the token that was not one.
+///
+/// A token that is not a number fails the whole request rather than being
+/// dropped: "78, n78" filtered to "78" and then locked would be a lock the
+/// operator did not ask for, which is the kind of quiet success this daemon
+/// does not do.
+fn band_tokens(raw: &str) -> Result<Vec<u32>, String> {
+    let mut out = Vec::new();
+    for token in raw.split(|c: char| c == ',' || c == ' ' || c == '\n' || c == '\t') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match token.parse::<u32>() {
+            Ok(band) => out.push(band),
+            Err(_) => return Err(format!("{token:?} is not a band number")),
+        }
+    }
+    if out.is_empty() {
+        return Err("no band numbers given".to_string());
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+fn rat_of(body: &str) -> Result<String, String> {
+    let rat = form_value(body, "rat").unwrap_or_default().trim().to_lowercase();
+    match rat.as_str() {
+        "lte" | "nr" => Ok(rat),
+        "" => Err("a RAT is required (lte or nr)".to_string()),
+        other => Err(format!("unknown RAT {other:?}: expected lte or nr")),
+    }
+}
+
+fn band_request(body: &str) -> Result<(String, Vec<u32>), String> {
+    let rat = rat_of(body)?;
+    let bands = band_tokens(&form_value(body, "bands").unwrap_or_default())?;
+    Ok((rat, bands))
+}
+
+fn cell_request(body: &str) -> Result<(String, u32, u32), String> {
+    let rat = rat_of(body)?;
+    let number = |key: &str| -> Result<u32, String> {
+        let raw = form_value(body, key).unwrap_or_default();
+        raw.trim()
+            .parse::<u32>()
+            .map_err(|_| format!("{key} must be a number, got {raw:?}"))
+    };
+    Ok((rat, number("freq")?, number("pci")?))
 }
 
 fn api_metrics(socket: &Path) -> Value {
@@ -552,6 +685,7 @@ const PAGE: &str = r#"<!doctype html>
 <h1>unisoc-cpd</h1>
 <div class="kv" id="baseband">…</div>
 <div class="chips" id="radio">…</div>
+<div class="chips" id="locks">…</div>
 <div class="chips" id="chips"></div>
 <div id="banner"><div id="bnr-txt" style="font-size:24px">+CRING: VOICE</div>
  <button onclick="act('answer')">接听</button><button class="red" onclick="act('hangup')">挂断</button></div>
@@ -567,6 +701,30 @@ const PAGE: &str = r#"<!doctype html>
 <details id="d-network"><summary>网络（运营商 · 5G SA/NSA · 注册状态）</summary>
 <button onclick="loadNetwork()">刷新</button>
 <div class="kv" id="network">展开后读取…</div></details>
+
+<details id="d-bands"><summary>锁频段（LTE / NR 带号 · AT+SPLBAND）</summary>
+<button onclick="loadLocks()">刷新</button>
+<div class="warn">⚠️ 锁到当前网络用不到的频段会直接失去服务（一直无信号直到解锁）。下面显示的是 CP 读回的
+当前锁定，不是你刚按下的按钮——写入后守护进程会立刻读回比对。</div>
+<div class="kv" id="bands-state">展开后读取…</div>
+<div>LTE <input id="lte-bands" placeholder="1,3,41" size="20" autocomplete="off">
+<button onclick="bandLock('lte')">锁定</button><button class="red" onclick="bandUnlock('lte')">解锁</button></div>
+<div id="band-quick-lte" class="hist"></div>
+<div>NR <input id="nr-bands" placeholder="41,78" size="20" autocomplete="off">
+<button onclick="bandLock('nr')">锁定</button><button class="red" onclick="bandUnlock('nr')">解锁</button></div>
+<div id="band-quick-nr" class="hist"></div>
+<div><button class="red" onclick="bandUnlock('')">LTE+NR 全部解锁</button></div>
+<pre id="bands-out">…</pre></details>
+
+<details id="d-cells"><summary>锁基站（EARFCN + PCI · AT+SPFORCEFRQ）</summary>
+<button onclick="loadLocks()">刷新</button>
+<div class="warn">⚠️ 锁基站比锁频段更紧：锁到一个不可用的小区会一直无服务。邻区列表里的“锁”会把参数填进来，
+但仍要你按一下才会写。</div>
+<div class="kv" id="cells-state">展开后读取…</div>
+<div>RAT <select id="cell-rat"><option value="lte">LTE</option><option value="nr">NR</option></select>
+EARFCN <input id="cell-freq" size="9" autocomplete="off"> PCI <input id="cell-pci" size="5" autocomplete="off">
+<button onclick="cellLock()">锁定</button><button class="red" onclick="cellUnlock()">解锁</button></div>
+<pre id="cells-out">…</pre></details>
 
 <h2>短信 · inbox</h2><div id="msgs">…</div>
 <h2>发短信</h2>
@@ -702,9 +860,12 @@ async function loadMetrics(){
     h += kv('邻区 LTE', d.neighbors_lte!=null ? d.neighbors_lte+' 个' : null);
     h += kv('邻区 NR', d.neighbors_nr!=null ? d.neighbors_nr+' 个' : null);
     (d.neighbors||[]).forEach(function(n){
-      h += '<div class="hist">' + esc(n.rat + '  band ' + (n.band||'—') + '  EARFCN ' + n.earfcn
+      h += '<div>' + esc(n.rat + '  band ' + (n.band||'—') + '  EARFCN ' + n.earfcn
         + '  PCI ' + n.pci + '  RSRP ' + n.rsrp + ' dBm  RSRQ ' + n.rsrq + ' dB'
-        + (n.sinr!=null ? '  SINR ' + n.sinr + ' dB' : '')) + '</div>'; });
+        + (n.sinr!=null ? '  SINR ' + n.sinr + ' dB' : ''))
+        + ' <button onclick="lockNeighbor(this.getAttribute(\'data-rat\'), this.getAttribute(\'data-freq\'), this.getAttribute(\'data-pci\'))"'
+        + ' data-rat="' + (n.rat==='NR'?'nr':'lte') + '" data-freq="' + n.earfcn + '" data-pci="' + n.pci + '"'
+        + '>锁</button></div>'; });
     if(!d.serving_supported) h += '<div class="err">CP 未上报服务小区测量（本代可能不支持 SPENGMD 测量树）</div>';
     el.innerHTML = h;
   }catch(e){ el.textContent = '读取失败: '+e; } }
@@ -718,10 +879,75 @@ async function loadNetwork(){
     if(d.error) h += '<div class="err">'+esc(d.error)+'</div>';
     el.innerHTML = h;
   }catch(e){ el.textContent = '读取失败: '+e; } }
+var COMMON_LTE = [1,3,5,8,34,38,39,40,41];
+var COMMON_NR = [1,28,41,77,78,79];
+function quickBands(){
+  function render(id, rat, bands){
+    document.getElementById(id).innerHTML = '常用：' + bands.map(function(b){
+      return '<span class="hist" onclick="addBand(this)" data-rat="'+rat+'" data-band="'+b+'">n'+b+'</span>';
+    }).join(' ');
+  }
+  render('band-quick-lte','lte',COMMON_LTE); render('band-quick-nr','nr',COMMON_NR);
+}
+function addBand(el){
+  var rat = el.getAttribute('data-rat'), band = el.getAttribute('data-band');
+  var input = document.getElementById(rat+'-bands');
+  var cur = input.value.split(/[\s,]+/).filter(Boolean);
+  if(cur.indexOf(band)<0) cur.push(band);
+  input.value = cur.join(',');
+}
+function locksChips(d){
+  const lb = (d.lte_bands||[]), nb = (d.nr_bands||[]);
+  const lc = (d.lte_cells||[]), nc = (d.nr_cells||[]);
+  document.getElementById('locks').innerHTML =
+    chip(0, lb.length ? 'LTE 锁 band '+lb.join(',') : 'LTE 未锁频段', lb.length?'bad':'dim') +
+    chip(0, nb.length ? 'NR 锁 band '+nb.join(',') : 'NR 未锁频段', nb.length?'bad':'dim') +
+    chip(0, (lc.length+nc.length) ? '已锁基站 '+(lc.length+nc.length)+' 个' : '未锁基站',
+         (lc.length+nc.length)?'bad':'dim');
+}
+function cellsText(rat, cells){
+  return cells.length
+    ? cells.map(function(c){ return rat.toUpperCase()+' '+c.freq+'/'+c.pci; }).join('  ')
+    : rat.toUpperCase()+' 未锁基站';
+}
+async function loadLocks(){
+  try{ const d = await get('/api/bands'); locksChips(d);
+    document.getElementById('bands-state').innerHTML =
+      kv('LTE 锁频段', (d.lte_bands||[]).length ? d.lte_bands.join(', ') : null) +
+      kv('NR 锁频段', (d.nr_bands||[]).length ? d.nr_bands.join(', ') : null) +
+      kv('SPRAT', d.sprat);
+    document.getElementById('cells-state').innerHTML =
+      kv('LTE 锁基站', cellsText('lte', d.lte_cells||[]).replace('LTE ','')) +
+      kv('NR 锁基站', cellsText('nr', d.nr_cells||[]).replace('NR ',''));
+    if(d.error) document.getElementById('bands-state').innerHTML += '<div class="err">'+esc(d.error)+'</div>';
+  }catch(e){} }
+async function bandLock(rat){
+  var v = document.getElementById(rat+'-bands').value.trim();
+  if(!v) return;
+  out('bands-out', await post('/api/band-lock', {rat:rat, bands:v})); loadLocks(); }
+async function bandUnlock(rat){
+  out('bands-out', await post('/api/band-unlock', {rat:rat})); loadLocks(); }
+async function cellLock(){
+  out('cells-out', await post('/api/cell-lock', {
+    rat: document.getElementById('cell-rat').value,
+    freq: document.getElementById('cell-freq').value.trim(),
+    pci: document.getElementById('cell-pci').value.trim() })); loadLocks(); }
+async function cellUnlock(){
+  out('cells-out', await post('/api/cell-unlock', {rat: document.getElementById('cell-rat').value}));
+  loadLocks(); }
+function lockNeighbor(rat, freq, pci){
+  document.getElementById('d-cells').open = true;
+  document.getElementById('cell-rat').value = rat;
+  document.getElementById('cell-freq').value = freq;
+  document.getElementById('cell-pci').value = pci;
+}
 function lazyLoad(){
+  quickBands();
   document.getElementById('d-identity').addEventListener('toggle', function(){ if(this.open) loadIdentity(); });
   document.getElementById('d-metrics').addEventListener('toggle', function(){ if(this.open) loadMetrics(); });
   document.getElementById('d-network').addEventListener('toggle', function(){ if(this.open) loadNetwork(); });
+  document.getElementById('d-bands').addEventListener('toggle', function(){ if(this.open) loadLocks(); });
+  document.getElementById('d-cells').addEventListener('toggle', function(){ if(this.open) loadLocks(); });
 }
 
 var atHist = [];
@@ -749,7 +975,11 @@ document.getElementById('at-cmd').addEventListener('keydown', atEnter);
 renderAtHist();
 setInterval(refreshState, 5000); setInterval(refreshUrc, 2000); setInterval(refreshMsgs, 8000);
 setInterval(refreshStatus, 20000); setInterval(refreshInfo, 60000);
-refreshState(); refreshUrc(); refreshMsgs(); refreshStatus(); refreshInfo(); lazyLoad();
+// The lock chips are a read-back of the CP's own state, so they are polled
+// like the rest of the status row -- slower, because it costs five AT
+// commands to ask.
+setInterval(loadLocks, 30000);
+refreshState(); refreshUrc(); refreshMsgs(); refreshStatus(); refreshInfo(); lazyLoad(); loadLocks();
 </script></body></html>
 
 "#;
@@ -874,6 +1104,49 @@ mod tests {
         assert_eq!(summary_all(&out, "neighbor").len(), 2);
         assert_eq!(summary(&out, "neighbors_lte").as_deref(), Some("1"));
         assert_eq!(summary(&out, "neighbors_nr"), None);
+    }
+
+    /// A band list is validated, not filtered: dropping a bad token and
+    /// locking the rest would be a lock nobody asked for.
+    #[test]
+    fn band_tokens_validate_instead_of_dropping() {
+        assert_eq!(band_tokens("78, 41").unwrap(), vec![41, 78]);
+        assert_eq!(band_tokens("3,3,3").unwrap(), vec![3]);
+        assert!(band_tokens("").is_err());
+        assert!(band_tokens("n78").is_err());
+        assert!(band_tokens("78,n41").is_err());
+    }
+
+    #[test]
+    fn a_lock_request_needs_a_known_rat_and_numbers() {
+        assert_eq!(
+            band_request("rat=nr&bands=78").unwrap(),
+            ("nr".to_string(), vec![78])
+        );
+        assert!(band_request("bands=78").is_err(), "no RAT");
+        assert!(band_request("rat=gsm&bands=78").is_err(), "not this generation");
+        let (rat, freq, pci) = cell_request("rat=lte&freq=1650&pci=88").unwrap();
+        assert_eq!((rat.as_str(), freq, pci), ("lte", 1650, 88));
+        assert!(cell_request("rat=lte&freq=abc&pci=88").is_err());
+        assert!(cell_request("rat=lte&pci=88").is_err());
+    }
+
+    #[test]
+    fn locked_bands_and_cells_come_out_of_the_summary_lines() {
+        let out = lines(&[
+            "lte_bands: 1,3,41",
+            "nr_bands: -",
+            "lte_cells: 1650/88 3000/7",
+            "nr_cells: -",
+            "sprat: LTE 32",
+        ]);
+        let state = band_state_of(&out);
+        assert_eq!(state["lte_bands"], json!([1, 3, 41]));
+        assert_eq!(state["nr_bands"], json!([]));
+        assert_eq!(state["lte_cells"][0]["freq"], 1650);
+        assert_eq!(state["lte_cells"][1]["pci"], 7);
+        assert_eq!(state["nr_cells"], json!([]));
+        assert_eq!(state["sprat"], "LTE 32");
     }
 
     #[test]

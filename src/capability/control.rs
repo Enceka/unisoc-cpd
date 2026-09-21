@@ -514,7 +514,7 @@ fn signal_neighbors(ctx: &mut Context) -> Result<Outcome> {
     let t = Duration::from_secs(8);
     let mut out = Vec::new();
 
-    let mut ask = |out: &mut Vec<String>, group: u32, index: u32| -> crate::at::Reply {
+    let ask = |out: &mut Vec<String>, group: u32, index: u32| -> crate::at::Reply {
         let cmd = crate::unisoc_at::engmd(group, index);
         let reply = session.command(&cmd, t, &[], 0);
         emit(out, &cmd, &reply);

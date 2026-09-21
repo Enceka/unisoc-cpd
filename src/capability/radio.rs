@@ -53,27 +53,42 @@ impl Capability for Band {
                 let sprat = session.command("AT+SPRAT?", Duration::from_secs(8), &[], 0);
                 emit(&mut out, "AT+SPRAT?", &sprat);
                 ok &= sprat.ok();
+                if let Some(line) = sprat.first_with_prefix("+SPRAT:") {
+                    out.push(format!(
+                        "sprat: {}",
+                        line.split_once(':').map(|(_, v)| v.trim()).unwrap_or("")
+                    ));
+                }
 
                 for rat in [Rat::Lte, Rat::Nr] {
                     let cmd = unisoc_at::band_query_command(rat);
                     let r = session.command(cmd, Duration::from_secs(8), &[], 0);
                     emit(&mut out, cmd, &r);
-                    if let Some(line) = r.first_with_prefix("+SPLBAND:") {
-                        let bands = unisoc_at::parse_locked_bands(line, rat);
-                        out.push(format!(
-                            "  -> {:<3} locked bands: {}",
-                            rat.as_str(),
-                            if bands.is_empty() {
-                                "(none)".to_string()
-                            } else {
-                                bands
-                                    .iter()
-                                    .map(|b| b.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(",")
-                            }
-                        ));
-                    }
+                    let bands = r
+                        .first_with_prefix("+SPLBAND:")
+                        .map(|l| unisoc_at::parse_locked_bands(l, rat))
+                        .unwrap_or_default();
+                    let list = bands
+                        .iter()
+                        .map(|b| b.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    out.push(format!(
+                        "  -> {:<3} locked bands: {}",
+                        rat.as_str(),
+                        if list.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            list.clone()
+                        }
+                    ));
+                    // The summary line the web UI reads: `-` is "no lock", so a
+                    // panel never has to tell an empty list from a missing one.
+                    out.push(format!(
+                        "{}_bands: {}",
+                        rat.as_str().to_ascii_lowercase(),
+                        if list.is_empty() { "-".to_string() } else { list }
+                    ));
                     ok &= r.ok();
                 }
 
@@ -81,14 +96,32 @@ impl Capability for Band {
                     let cmd = unisoc_at::cell_query_command(rat);
                     let r = session.command(&cmd, Duration::from_secs(8), &[], 0);
                     emit(&mut out, &cmd, &r);
-                    if let Some(line) = r.first_with_prefix("+SPFORCEFRQ:") {
-                        let cells = unisoc_at::parse_locked_cells(line, rat);
-                        if !cells.is_empty() {
-                            let shown: Vec<String> =
-                                cells.iter().map(|(f, p)| format!("{f}/{p}")).collect();
-                            out.push(format!("  -> {:<3} locked cells: {}", rat.as_str(), shown.join(" ")));
-                        }
+                    let cells = r
+                        .first_with_prefix("+SPFORCEFRQ:")
+                        .map(|l| unisoc_at::parse_locked_cells(l, rat))
+                        .unwrap_or_default();
+                    if !cells.is_empty() {
+                        let shown: Vec<String> =
+                            cells.iter().map(|(f, p)| format!("{f}/{p}")).collect();
+                        out.push(format!(
+                            "  -> {:<3} locked cells: {}",
+                            rat.as_str(),
+                            shown.join(" ")
+                        ));
                     }
+                    out.push(format!(
+                        "{}_cells: {}",
+                        rat.as_str().to_ascii_lowercase(),
+                        if cells.is_empty() {
+                            "-".to_string()
+                        } else {
+                            cells
+                                .iter()
+                                .map(|(f, p)| format!("{f}/{p}"))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        }
+                    ));
                 }
                 Ok(outcome(out, ok))
             }

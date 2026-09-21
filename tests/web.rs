@@ -110,6 +110,10 @@ fn web_serves_the_page_and_the_daemons_state() {
     let mut identity_ok = false;
     let mut network_ok = false;
     let mut metrics_ok = false;
+    let mut bands_ok = false;
+    let mut band_lock_ok = false;
+    let mut rejected_ok = false;
+    let mut cell_lock_ok = false;
     for _ in 0..50 {
         std::thread::sleep(Duration::from_millis(200));
         if let Some(body) = http_try(port, "/") {
@@ -156,7 +160,52 @@ fn web_serves_the_page_and_the_daemons_state() {
                     && body.contains("627264");
             }
         }
-        if page_ok && state_ok && dial_ok && at_ok && info_ok && identity_ok && network_ok && metrics_ok
+        if !bands_ok {
+            // The fake CP is locked to bands 1,3,41 and 1,78,80 out of the box.
+            if let Some(body) = http_try(port, "/api/bands") {
+                bands_ok |= body.contains("\"lte_bands\":[1,3,41]")
+                    && body.contains("\"nr_bands\":[1,78,80]");
+            }
+        }
+        if !band_lock_ok {
+            if let Some(body) = http_post_try(port, "/api/band-lock", "rat=nr&bands=78") {
+                band_lock_ok |= body.contains("\"status\":\"pass\"");
+            }
+            if band_lock_ok {
+                // and the read-back the panel shows is the CP's answer
+                if let Some(body) = http_try(port, "/api/bands") {
+                    band_lock_ok &= body.contains("\"nr_bands\":[78]");
+                }
+            }
+        }
+        if !cell_lock_ok {
+            if let Some(body) = http_post_try(port, "/api/cell-lock", "rat=lte&freq=1650&pci=88") {
+                cell_lock_ok |= body.contains("\"status\":\"pass\"");
+            }
+            if cell_lock_ok {
+                if let Some(body) = http_try(port, "/api/bands") {
+                    cell_lock_ok &= body.contains("\"freq\":1650");
+                }
+            }
+        }
+        if !rejected_ok {
+            // A typo must fail the request, not lock the bands that parsed.
+            if let Some(body) = http_post_try(port, "/api/band-lock", "rat=nr&bands=n78") {
+                rejected_ok |= body.contains("is not a band number");
+            }
+        }
+        if page_ok
+            && state_ok
+            && dial_ok
+            && at_ok
+            && info_ok
+            && identity_ok
+            && network_ok
+            && metrics_ok
+            && bands_ok
+            && band_lock_ok
+            && cell_lock_ok
+            && rejected_ok
         {
             break;
         }
@@ -172,4 +221,8 @@ fn web_serves_the_page_and_the_daemons_state() {
     assert!(identity_ok, "/api/identity did not report ICCID/phone/IMSI");
     assert!(network_ok, "/api/network did not report the operator and the RAT");
     assert!(metrics_ok, "/api/metrics did not report the serving cell and neighbours");
+    assert!(bands_ok, "/api/bands did not report the locked bands");
+    assert!(band_lock_ok, "a band lock was not read back through /api/bands");
+    assert!(cell_lock_ok, "a cell lock was not read back through /api/bands");
+    assert!(rejected_ok, "a bad band token was not rejected");
 }
