@@ -79,6 +79,26 @@ pub enum Urc {
         number: String,
         address_type: Option<u32>,
     },
+    /// `+CLCCS: …` — this generation's per-call state line for VoLTE, parsed
+    /// the way the vendor RIL parses it (impl-ril/ril_call.c,
+    /// `callFromCLCCLineVoLTE`).  The state is carried verbatim because its
+    /// values are the CP's own (1 idle, 2 calling, 5 alerting, 6 active, 12
+    /// waiting, 13/14 held) and mapping them into RIL names here would be a
+    /// guess until one has been measured on the unit.  On this firmware the
+    /// VoLTE path suppresses `+CRING`-driven call-state events, which makes
+    /// this line the one place a VoLTE call announces itself.
+    #[serde(rename = "urc-call-state")]
+    CallState {
+        index: u32,
+        is_mt: bool,
+        media: Option<String>,
+        cs_mode: Option<u32>,
+        state: Option<u32>,
+        mpty: Option<u32>,
+        number_type: Option<u32>,
+        ton: Option<u32>,
+        number: Option<String>,
+    },
     /// `+CUSD: 0,"balance 12.34 CNY",15`.
     #[serde(rename = "urc-ussd")]
     Ussd { status: u32, text: String },
@@ -103,6 +123,7 @@ impl Urc {
             Urc::NewMessage { .. } => "urc-new-message",
             Urc::MessageStorage { .. } => "urc-message-storage",
             Urc::IncomingCall { .. } => "urc-incoming-call",
+            Urc::CallState { .. } => "urc-call-state",
             Urc::CallerId { .. } => "urc-caller-id",
             Urc::Ussd { .. } => "urc-ussd",
             Urc::SpError { .. } => "urc-sp-error",
@@ -172,6 +193,26 @@ impl Urc {
             }
             Urc::MessageStorage { text } => format!("message storage: {text}"),
             Urc::IncomingCall { ring } => format!("incoming call ({ring})"),
+            Urc::CallState {
+                index,
+                is_mt,
+                media,
+                state,
+                number,
+                ..
+            } => {
+                let dir = if *is_mt { "MT" } else { "MO" };
+                let number = number
+                    .as_ref()
+                    .map(|n| format!(" {n}"))
+                    .unwrap_or_default();
+                format!(
+                    "+CLCCS idx={index} dir={dir} media={} state={}{}",
+                    media.as_deref().unwrap_or("-"),
+                    state.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+                    number
+                )
+            }
             Urc::CallerId { number, .. } => format!("caller id {number}"),
             Urc::Ussd { status, text } => format!("USSD {status}: {text}"),
             Urc::SpError { code, text } => match code {
@@ -294,6 +335,27 @@ fn ussd(line: &str) -> Urc {
 /// line); anything shaped like a URC comes back as a variant, `Urc::Other`
 /// included, so a caller can never mistake "we decoded it" for "there was
 /// nothing there".
+/// `+CLCCS:` — the field order the vendor parser reads: index, direction,
+/// negotiation pair, media, mode, state, mpty, then the optional number block.
+/// Everything past the number is left alone: the vendor parser reads a
+/// `localHold` further out, but its position in this generation's answer has
+/// not been measured, and a guessed index would read a priority as a boolean.
+fn call_state(line: &str) -> Urc {
+    let b = body(line);
+    let number = field(b, 10).map(unquote).filter(|n| !n.is_empty());
+    Urc::CallState {
+        index: as_u32(field(b, 0)).unwrap_or(0),
+        is_mt: field(b, 1).map(|f| f.trim() == "1").unwrap_or(false),
+        media: field(b, 4).map(unquote).filter(|m| !m.is_empty()),
+        cs_mode: as_u32(field(b, 5)),
+        state: as_u32(field(b, 6)),
+        mpty: as_u32(field(b, 7)),
+        number_type: as_u32(field(b, 8)),
+        ton: as_u32(field(b, 9)),
+        number,
+    }
+}
+
 pub fn classify(line: &str) -> Option<Urc> {
     let l = line.trim();
     if l.is_empty() {
@@ -353,6 +415,7 @@ pub fn classify(line: &str) -> Option<Urc> {
         "+CRING:" => Urc::IncomingCall {
             ring: unquote(b).to_uppercase(),
         },
+        "+CLCCS:" => call_state(l),
         "+CLIP:" => Urc::CallerId {
             number: unquote(field(b, 0).unwrap_or("")),
             address_type: as_u32(field(b, 1)),
@@ -484,6 +547,58 @@ mod tests {
             }
         );
         assert_eq!(u.detail(), "new message in SM at index 3");
+    }
+
+    /// The VoLTE per-call line, in the shape the vendor parser reads: the
+    /// number is optional and everything past it is left alone.
+    #[test]
+    fn a_clccs_line_is_decoded_verbatim() {
+        let u = classify(
+            "+CLCCS: 1,1,0,0,\"audio\",0,6,0,145,129,\"+8613800138000\",0,0,0,0,1",
+        )
+        .unwrap();
+        assert_eq!(u.kind(), "urc-call-state");
+        assert_eq!(
+            u,
+            Urc::CallState {
+                index: 1,
+                is_mt: true,
+                media: Some("audio".into()),
+                cs_mode: Some(0),
+                state: Some(6),
+                mpty: Some(0),
+                number_type: Some(145),
+                ton: Some(129),
+                number: Some("+8613800138000".into()),
+            }
+        );
+        assert_eq!(
+            u.detail(),
+            "+CLCCS idx=1 dir=MT media=audio state=6 +8613800138000"
+        );
+    }
+
+    /// A call with no number yet (an early MT state) keeps the field absent,
+    /// and the detail line does not end with a dangling separator.
+    #[test]
+    fn a_clccs_line_without_a_number_is_kept() {
+        let u = classify("+CLCCS: 2,1,0,0,\"audio\",0,12,0").unwrap();
+        match &u {
+            Urc::CallState {
+                index,
+                is_mt,
+                state,
+                number,
+                ..
+            } => {
+                assert_eq!(*index, 2);
+                assert!(*is_mt);
+                assert_eq!(*state, Some(12));
+                assert!(number.is_none());
+            }
+            _ => panic!("not a call state"),
+        }
+        assert_eq!(u.detail(), "+CLCCS idx=2 dir=MT media=audio state=12");
     }
 
     #[test]

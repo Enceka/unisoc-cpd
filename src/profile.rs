@@ -190,6 +190,16 @@ pub struct Boot {
 pub struct Voice {
     pub supported: bool,
     pub mixer: Vec<String>,
+    /// The ALSA card the voice route lives on, as `amixer -c` accepts it: an
+    /// index or a name.  Measured hook of the vendor RIL
+    /// (impl-ril/ril_call.c `speaker_mute`).
+    pub card: Option<String>,
+    /// The control the RIL toggles, `"Speaker Playback Switch"`.
+    pub control: Option<String>,
+    /// The mixer tool.  The RIL calls `alsa_amixer`; the Linux rootfs would use
+    /// `amixer` from alsa-utils -- and an image that ships neither is a fact
+    /// `voice` reports rather than papers over.
+    pub tool: Option<String>,
 }
 
 /// One NV item that holds part of the device identity (see `capability::imei`).

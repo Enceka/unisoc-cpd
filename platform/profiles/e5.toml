@@ -157,8 +157,17 @@ route_table = "legacy_system"
 clients = ["wlan0"]
 
 [voice]
-# No UCM port yet, so there is no in-call audio path to route.
+# No UCM port yet, so there is no in-call audio path to route.  The mixer hook
+# the vendor RIL itself uses is measured and named here
+# (impl-ril/ril_call.c speaker_mute: alsa_amixer cset -c phone …), but this
+# image ships no mixer tool at all -- measured 2026-09-21, no amixer /
+# alsa_amixer / tinymixer under /system or /vendor -- so `voice` reports the
+# switch as unavailable until the rootfs carries alsa-utils.  Card 0 is
+# sprdphone-sc2730; the RIL's `-c phone` alias does not resolve on this image.
 supported = false
+card = "0"
+control = "Speaker Playback Switch"
+tool = "amixer"
 mixer = []
 
 [telemetry]
