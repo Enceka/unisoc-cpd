@@ -239,3 +239,65 @@ it._
   and "the CP has asserted" are not the same event, and a watchdog keys on
   `state.last_ok_age_s` — the age of the last command the CP actually
   answered — not on asserts.
+
+---
+
+## 13. The AT server does not survive a no-reader window: the takeover has a deadline
+
+_2026-09-21, two takeovers on one boot, same setup as §1._
+
+The first takeover of the day was slow: `stop vendor.ril-daemon`, then about
+**three minutes with nobody reading either channel** before `serve` started.
+The CP's AT server was gone.  Seven commands, seven timeouts, zero response
+lines — not even `ERROR` — and zero CP asserts in the kernel log.  The URC
+channel's only output was the parked backlog: 20 lines, every one of them
+signal-grade `rssi 99` (the §2 shutdown park), and then silence.  §25.3 of
+yesterday showed the park leaving AT alive; today the idle window took the AT
+server down with it — §12's second death, with the trigger now identifiable.
+
+Recovery was the vendor path: serve killed, `start vendor.ril-daemon`, modem
+back (`IN_SERVICE`, NR SA).  The second takeover was fast: `stop` and `serve`
+within seconds.  Everything answered: **59 commands, 29 OK, 0 timeouts, one
+open per channel, zero reopens, for the whole session — including the first
+call (§14).**
+
+The measurable rule: **between the RIL's death and the daemon's first open
+there is a window — fine at seconds, dead at ~3 minutes — in which this CP's
+AT server goes away on its own.**  A resident owner is not only about the
+one-reader rule; the transfer has a deadline, and the exact length of the
+window is unmeasured (n = 2).  Until it is measured, the procedure is: stop
+the old owner and open the channels immediately; never leave the CP
+unattended between them.
+
+## 14. The first VoLTE call: IMS registers without the vendor stack, and the daemon answers
+
+_2026-09-21, the fast takeover of §13, handset on the 广电 (46015) network._
+
+* **The network is VoLTE-only here.**  The Android oracle reports the CS
+  domain NOT registered on NR while PS is HOME, and the operator block
+  carries `mVopsSupport = 1` (voice over PS supported).  On this network a
+  call is IMS or nothing — the contracts' "CS only" voice row needs the
+  VoLTE reading below.
+* **Right after the RIL dies, IMS is gone too.**  The CP answers AT (fast
+  takeover) but `+CIREG: 0,0,0` with `+CAVIMS: 1` — VoLTE enabled, not
+  registered.  The surviving `ims` context (§7) carries no registration.
+* **The daemon brings IMS up itself.**  `cfun cold` (§2's cycle) ran under
+  the daemon: `+CFUN: 1`, then PS registered (`+CEREG: 2,1,…,11`, NR SA),
+  then **`+CIREG: 0,1,0` — IMS registered, with urild dead and no vendor IMS
+  daemon running.**  The CP carries its own IMS client; what the vendor stack
+  contributes to registration is configuration and keep-alive, not the
+  registration act.  (This withdraws the same-session assumption that IMS
+  would need the vendor stack.)
+* **The call itself, end to end under the daemon:** the network delivered an
+  MT VoLTE call — `+CRING: VOICE` every 5 s, decoded as `urc-incoming-call`
+  events; `ATA` answered with `OK` and the far end confirmed the call was
+  up; the far end released, and `AT+CLCC` was clean afterwards.  (Note for
+  tooling: this generation answers voice `ATA` with `OK`, not `CONNECT` —
+  a caller that waits for `CONNECT` will read a successful answer as a
+  failure.)
+
+**Still open for A9:** in-call audio (the profile still says
+`voice.supported = false`; nobody has measured whether the CP's default
+route carries audio on this bench), MO dial, DTMF, and the five-minute
+two-way run.
+
