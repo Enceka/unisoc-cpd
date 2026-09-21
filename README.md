@@ -70,7 +70,7 @@ unisoc-cpd --profile e5 --mode native band status
 unisoc-cpd --profile e5 --mode native band lock nr 78
 unisoc-cpd --profile e5 --mode vendor register               # vendor baseline
 unisoc-cpd --profile e5 --mode native nv list                # read-only
-unisoc-cpd --socket /run/unisoc-cpd/cmd.sock web 0.0.0.0:8080  # W7: the browser face
+unisoc-cpd --socket /run/unisoc-cpd/cmd.sock web 0.0.0.0:7887  # W7: the browser face
 ```
 
 `--mode vendor` runs the command the profile names for that capability and

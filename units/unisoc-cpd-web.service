@@ -9,7 +9,7 @@ Requires=unisoc-cpd.service
 # itself, which is why it Requires= the daemon but opens no tty.
 ExecStart=/usr/local/bin/unisoc-cpd --profile e5 --mode native \
     --runs-dir /var/lib/unisoc-cpd/runs --state-dir /run/unisoc-cpd \
-    --socket /run/unisoc-cpd/cmd.sock web 0.0.0.0:8080
+    --socket /run/unisoc-cpd/cmd.sock web 0.0.0.0:7887
 Restart=on-failure
 RestartSec=5
 

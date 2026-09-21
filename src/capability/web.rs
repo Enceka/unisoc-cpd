@@ -15,6 +15,16 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Where the page listens when no address is given.
+///
+/// The systemd unit names its own interface (`0.0.0.0`, so the page is
+/// reachable over the USB gadget network rather than only from the phone
+/// itself), so the *port* is the part that has to stay in one place: the test
+/// at the bottom of this file fails if the unit and this constant drift apart,
+/// which is exactly how a deployment ends up serving a port the docs do not
+/// name.
+pub const DEFAULT_LISTEN: &str = "127.0.0.1:7887";
+
 pub struct Web;
 
 impl Capability for Web {
@@ -37,7 +47,7 @@ impl Capability for Web {
         let listen = positionals(args)
             .first()
             .cloned()
-            .unwrap_or_else(|| "127.0.0.1:8080".into());
+            .unwrap_or_else(|| DEFAULT_LISTEN.into());
         let listener =
             TcpListener::bind(&listen).with_context(|| format!("cannot listen on {listen}"))?;
         println!("unisoc-cpd web: http://{listen} (daemon on {})", socket.display());
@@ -1323,6 +1333,27 @@ mod tests {
         ))
         .unwrap();
         assert!(overridden.contains(&"--allow-bad-checksum".to_string()));
+    }
+
+    /// Two places can name the port -- this constant and the systemd unit that
+    /// actually ships -- and a deployment where they disagree serves a port
+    /// nobody documented.  So the test reads the unit.
+    #[test]
+    fn the_unit_and_the_code_agree_on_the_default_port() {
+        let port = DEFAULT_LISTEN
+            .rsplit(':')
+            .next()
+            .expect("a listen address has a port");
+        assert_eq!(port, "7887");
+        let unit = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/units/unisoc-cpd-web.service"
+        ))
+        .expect("the web unit is part of the tree");
+        assert!(
+            unit.contains(&format!(":{port}")),
+            "the web unit does not listen on :{port}:\n{unit}"
+        );
     }
 
     #[test]
