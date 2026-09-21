@@ -383,7 +383,7 @@ impl Capability for Signal {
         let cesq = session.command("AT+CESQ", t, &[], 0);
 
         if let Some(line) = cesq.first_with_prefix("+CESQ:") {
-            if let Some((rsrp, rsrq, sinr)) = decode_cesq(line) {
+            if let Some(cesq) = decode_cesq(line) {
                 // A field the modem did not report must not look like a very
                 // bad reading: "not reported" is a fact, "-115 dBm" is a lie
                 // the reader will believe.  Measured on the device: the idle
@@ -398,10 +398,15 @@ impl Capability for Signal {
                 };
                 out.push(format!(
                     "decoded: RSRP {}, RSRQ {}, SINR {}",
-                    dbm(rsrp),
-                    db(rsrq),
-                    db(sinr)
+                    dbm(cesq.rsrp),
+                    db(cesq.rsrq),
+                    db(cesq.sinr)
                 ));
+                // Which family the numbers came from is part of the answer: on
+                // NR SA the LTE fields are all 255 and the values are the SS
+                // extension, which reads a few dB differently from a wideband
+                // measurement.
+                out.push(format!("cesq_source: {}", cesq.source));
             }
         }
         let ok = each(&mut out, &[("AT+CSQ", csq), ("AT+CESQ", cesq)]);
@@ -415,18 +420,49 @@ impl Capability for Signal {
 /// `idx-140` yields "115 dBm", which a reader will believe.  An unreported
 /// field comes back as `None` so the display can say so.  (Measured on the
 /// device, 2026-09-20: an unregistered CP answers 255 in every field.)
-pub fn decode_cesq(line: &str) -> Option<(Option<i32>, Option<f64>, Option<f64>)> {
+/// What `+CESQ` decoded into, and which family of fields the numbers came from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cesq {
+    pub rsrp: Option<i32>,
+    pub rsrq: Option<f64>,
+    pub sinr: Option<f64>,
+    /// `nr-ss` when the numbers are the NR SS extension this CP appends after
+    /// the LTE fields (6 ssrsrq, 7 ssrsrp, 8 sssinr -- measured 66/55/60 on the
+    /// unit), `lte` when they are the 27.007 fields.
+    pub source: &'static str,
+}
+
+pub fn decode_cesq(line: &str) -> Option<Cesq> {
     let body = line.split_once(':')?.1;
     let parts: Vec<&str> = body.split(',').map(|s| s.trim()).collect();
     let idx = |i: usize| parts.get(i).and_then(|v| v.parse::<i32>().ok());
     let rsrp_idx = idx(5)?;
     let rsrq_idx = idx(4)?;
-    // 3GPP mapping over the reported *index*, 0..97 -> -140..-44 dBm.
     let reported = |v: i32| (v != 255).then_some(v);
-    let rsrp = reported(rsrp_idx).map(|idx| idx - 140);
-    let rsrq = reported(rsrq_idx).map(|idx| -19.5 + idx as f64 * 0.5);
-    let sinr = idx(8).and_then(reported).map(|v| (v as f64 - 20.0) / 2.0);
-    Some((rsrp, rsrq, sinr))
+
+    // The LTE fields, 27.007: the RSRP index spans 0..97 -> -140..-44 dBm, the
+    // RSRQ index 0..34 -> -19.5..-3 dB.
+    let lte_rsrp = reported(rsrp_idx).map(|idx| idx - 140);
+    let lte_rsrq = reported(rsrq_idx).map(|idx| -19.5 + idx as f64 * 0.5);
+
+    // The NR SS extension, mapped over TS 38.215: SS-RSRP 0..253 -> -156..+97
+    // dBm in 1 dB steps, SS-RSRQ 0..127 -> -43..+20 dB in 0.5 dB steps, SS-SINR
+    // 0..127 -> -23..+40 dB in 0.5 dB steps.  Cross-checked against the modem's
+    // own SPENGMD serving measurement on the unit: ssrsrp 55 read back as
+    // -101 dBm against a wideband -103, while the SS-SINR the previous mapping
+    // produced (20 dB for index 60) sat 13 dB above anything the same CESQ's
+    // own RSRP and RSRQ could support.
+    let ss_rsrp = idx(7).and_then(reported).map(|v| v - 156);
+    let ss_rsrq = idx(6).and_then(reported).map(|v| -43.0 + v as f64 * 0.5);
+    let ss_sinr = idx(8).and_then(reported).map(|v| -23.0 + v as f64 * 0.5);
+
+    let nr_ss = ss_rsrp.is_some() || ss_rsrq.is_some() || ss_sinr.is_some();
+    Some(Cesq {
+        rsrp: ss_rsrp.or(lte_rsrp),
+        rsrq: ss_rsrq.or(lte_rsrq),
+        sinr: ss_sinr,
+        source: if nr_ss { "nr-ss" } else { "lte" },
+    })
 }
 
 // ---------------------------------------------- the measurement tree (W5)
@@ -1091,22 +1127,27 @@ mod tests {
 
     #[test]
     fn cesq_treats_255_as_not_reported() {
-        // The measured idle answer: every field 255.  Decoding it as an index
-        // yields "115 dBm", which is exactly the lie this test pins out.
-        let (rsrp, rsrq, sinr) = decode_cesq("+CESQ: 99,99,255,255,255,255,75,67,73").unwrap();
-        assert_eq!(rsrp, None);
-        assert_eq!(rsrq, None);
-        // The SS-SINR field (73) *was* reported, and only it decodes.
-        assert_eq!(sinr, Some(26.5));
+        // The measured idle answer: the LTE fields all 255, the SS extension
+        // carrying the NR readings.  Cross-checked against the modem's own
+        // SPENGMD serving measurement at the same moment (RSRP -103, RSRQ
+        // -11.6): the SS mappings land beside it, where the old SS-SINR
+        // formula put 20 dB into a link whose own RSRP and RSRQ ruled it out.
+        let cesq = decode_cesq("+CESQ: 99,99,255,255,255,255,66,55,60").unwrap();
+        assert_eq!(cesq.source, "nr-ss");
+        assert_eq!(cesq.rsrp, Some(-101));
+        assert_eq!(cesq.rsrq, Some(-10.0));
+        assert_eq!(cesq.sinr, Some(7.0));
     }
 
-    /// A short `+CESQ` (no SS- fields at all) still decodes the ones it has.
+    /// A short `+CESQ` (no SS- fields at all) still decodes the ones it has,
+    /// and says they came from the LTE fields.
     #[test]
     fn cesq_without_the_ss_fields_still_decodes() {
-        let (rsrp, rsrq, sinr) = decode_cesq("+CESQ: 99,99,255,255,20,60").unwrap();
-        assert_eq!(rsrp, Some(-80));
-        assert_eq!(rsrq, Some(-9.5));
-        assert_eq!(sinr, None);
+        let cesq = decode_cesq("+CESQ: 99,99,255,255,20,60").unwrap();
+        assert_eq!(cesq.source, "lte");
+        assert_eq!(cesq.rsrp, Some(-80));
+        assert_eq!(cesq.rsrq, Some(-9.5));
+        assert_eq!(cesq.sinr, None);
     }
 
     #[test]
@@ -1184,9 +1225,12 @@ mod tests {
 
     #[test]
     fn cesq_decodes_a_real_reading() {
-        // rsrp index 60 -> -80 dBm, rsrq index 20 -> -9.5 dB
-        let (rsrp, rsrq, _) = decode_cesq("+CESQ: 99,99,255,255,20,60,75,67,73").unwrap();
-        assert_eq!(rsrp, Some(-80));
-        assert_eq!(rsrq, Some(-9.5));
+        // The SS extension wins over the LTE fields when it is present: 67 ->
+        // -89 dBm, 75 -> -5.5 dB, 73 -> 13.5 dB, all over TS 38.215.
+        let cesq = decode_cesq("+CESQ: 99,99,255,255,20,60,75,67,73").unwrap();
+        assert_eq!(cesq.source, "nr-ss");
+        assert_eq!(cesq.rsrp, Some(-89));
+        assert_eq!(cesq.rsrq, Some(-5.5));
+        assert_eq!(cesq.sinr, Some(13.5));
     }
 }

@@ -297,8 +297,12 @@ fn registration(line: &str, domain: RegDomain) -> Urc {
 fn signal(line: &str) -> Urc {
     let b = body(line);
     if line.starts_with("+CESQ:") {
-        let (rsrp, rsrq, sinr) =
-            crate::capability::control::decode_cesq(line).unwrap_or((None, None, None));
+        let cesq = crate::capability::control::decode_cesq(line);
+        let none = (None, None, None);
+        let (rsrp, rsrq, sinr) = match cesq {
+            Some(c) => (c.rsrp, c.rsrq, c.sinr),
+            None => none,
+        };
         Urc::Signal {
             rssi: as_i32(field(b, 0)),
             ber: as_i32(field(b, 1)),
@@ -514,9 +518,9 @@ mod tests {
             Urc::Signal {
                 rssi: Some(99),
                 ber: Some(99),
-                rsrp: Some(-80),
-                rsrq: Some(-9.5),
-                sinr: Some((73.0 - 20.0) / 2.0),
+                rsrp: Some(-89),
+                rsrq: Some(-5.5),
+                sinr: Some(-23.0 + 73.0 / 2.0),
             }
         );
     }

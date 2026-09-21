@@ -175,8 +175,8 @@ fn signal_decodes_cesq() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "stdout:\n{stdout}");
-    // index 60 -> -80 dBm, index 20 -> -9.5 dB
-    assert!(stdout.contains("RSRP -80 dBm"), "stdout:\n{stdout}");
+    // the SS extension wins: 67 -> -89 dBm, 75 -> -5.5 dB, 73 -> 13.5 dB
+    assert!(stdout.contains("RSRP -89 dBm"), "stdout:\n{stdout}");
 }
 
 #[test]
