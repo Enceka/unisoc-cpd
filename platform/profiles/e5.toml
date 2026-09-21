@@ -94,6 +94,17 @@ write_command = 'AT+SPIMEI={index},"{imei}"'
 # prefixed AT+SPACTCARD=<phoneId>; executes against that card's context --
 # but measured on the unit it only ever serves the ACTIVE card, so per-slot
 # AT reads are not a way to see a second slot's identity (diag items are).
+#
+# Re-measured 2026-09-21 (Android side, vendor RIL stopped) while looking for a
+# per-slot IMEI read: `AT+CGSN` and `AT+SPIMEI?` both answer with the *primary*
+# card's IMEI (same 15 digits), and every per-slot form is refused --
+# `AT+SPACTCARD=<n>;AT+CGSN` and `AT+SPIMEICHECK?` with CME 65536014 ("not
+# supported"), `AT+SPIMEI=<n>` with 21, `AT+CGSN=1|2|3` and the bare `AT+SPIMEI`
+# with 65536014, `AT+SPCARDINFO=<n>` with 50.  `AT+SPIMEICHECK` alone answers
+# `+SPIMEICHECK: 0`, which is a status flag, not an identity.  So on this
+# firmware there is no AT path to the second slot's IMEI, and the diag items are
+# the only one -- and 5e82/5e90 read all zeros on this unit, i.e. no second
+# identity is provisioned at all.
 probes = [
   "AT+SPIMEI?",
   "AT+EGMR?",

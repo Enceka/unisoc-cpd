@@ -42,6 +42,50 @@ pub fn sim_slot_label(index: u32) -> &'static str {
     }
 }
 
+/// Whether an NV identity item actually holds one.
+///
+/// An unprovisioned item reads as fifteen zeros, and fifteen zeros *pass* the
+/// Luhn check -- so the read-back cannot tell them apart from a value, and the
+/// panel showed `000000000000000` next to the one real IMEI.  Measured on this
+/// unit (2026-09-21): item 5e82 (SIM 2) and 5e90 (spare) are unprovisioned;
+/// there is no second identity on this handset, and no AT command that reads
+/// one (`AT+CGSN` and `AT+SPIMEI?` both answer with the primary card's IMEI,
+/// and the per-slot forms are refused -- see the probes in
+/// `docs/FINDINGS.md`).
+pub fn is_provisioned(imei: &str) -> bool {
+    !imei.is_empty() && imei.bytes().any(|b| b != b'0')
+}
+
+/// What one item's read produced.
+pub enum ItemRead<'a> {
+    Value(&'a str),
+    NotProvisioned,
+    Failed(&'a str),
+}
+
+/// One line of `imei read`, from the item and what its read produced.
+///
+/// Pure, so the three outcomes are pinned without a device: a value, an
+/// unprovisioned item, and a read that failed.  None of them may be rendered
+/// as one of the others.
+pub fn render_item(index: u32, item_id: &str, read: ItemRead<'_>) -> String {
+    let head = format!("imei{index} ({}, item {item_id})", sim_slot_label(index));
+    match read {
+        ItemRead::Value(value) => format!(
+            "{head} = {value}{}",
+            if identity::luhn_valid(value) {
+                ""
+            } else {
+                "  (LUHN INVALID -- treat with suspicion)"
+            }
+        ),
+        ItemRead::NotProvisioned => {
+            format!("{head}: not provisioned (the NV item reads all zeros)")
+        }
+        ItemRead::Failed(error) => format!("{head}: {error}"),
+    }
+}
+
 /// Parse and validate the `write` arguments.  Pure, so the guards are
 /// testable without a device: returns (imei, index, backup_dir).
 pub fn parse_write_args(args: &[String]) -> Result<(String, u32, Option<String>)> {
@@ -161,35 +205,29 @@ impl Capability for Imei {
                     if wanted.is_some_and(|w| w != it.index) {
                         continue;
                     }
-                    match read_item(ctx, it.index) {
-                        Ok(imei) => {
+                    // Three outcomes, kept apart on purpose: a value, an item
+                    // that was never provisioned, and a read that failed.  The
+                    // first is the identity, the second is a fact about the
+                    // handset, the third is a fact about the read.
+                    let line = match read_item(ctx, it.index) {
+                        Ok(value) if is_provisioned(&value) => {
                             any = true;
-                            out.push(format!(
-                                "imei{} ({}, item {}) = {}{}",
-                                it.index,
-                                sim_slot_label(it.index),
-                                it.id,
-                                imei,
-                                if identity::luhn_valid(&imei) {
-                                    ""
-                                } else {
-                                    "  (LUHN INVALID -- treat with suspicion)"
-                                }
-                            ));
+                            render_item(it.index, &it.id, ItemRead::Value(&value))
                         }
-                        Err(e) => out.push(format!(
-                            "imei{} ({}, item {}): {e:#}",
-                            it.index,
-                            sim_slot_label(it.index),
-                            it.id
-                        )),
-                    }
+                        Ok(_) => render_item(it.index, &it.id, ItemRead::NotProvisioned),
+                        Err(e) => render_item(it.index, &it.id, ItemRead::Failed(&format!("{e:#}"))),
+                    };
+                    out.push(line);
                 }
                 ctx.event("imei-read", out.join(" | "));
                 if any {
                     Ok(Outcome::pass(out))
                 } else {
-                    out.push("no item produced a record; try imei probe for the AT surface".into());
+                    out.push(
+                        "no item holds an identity: this handset has no IMEI provisioned \
+                         for these slots (imei probe reports the AT surface)"
+                            .into(),
+                    );
                     Ok(Outcome::fail(out))
                 }
             }
@@ -328,6 +366,38 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Fifteen zeros *pass* the Luhn check, which is exactly why an
+    /// unprovisioned item cannot be spotted by the read-back's own validation.
+    #[test]
+    fn an_unprovisioned_item_is_not_an_imei() {
+        assert!(identity::luhn_valid("000000000000000"));
+        assert!(!is_provisioned("000000000000000"));
+        assert!(!is_provisioned(""));
+        assert!(is_provisioned("490154203237518"));
+    }
+
+    /// A value, an unprovisioned item and a failed read are three different
+    /// facts and none may be rendered as another.
+    #[test]
+    fn the_three_read_outcomes_read_differently() {
+        let value = render_item(0, "5e81", ItemRead::Value("490154203237518"));
+        assert!(value.contains("SIM 1"), "{value}");
+        assert!(value.contains("= 490154203237518"), "{value}");
+        assert!(!value.contains("LUHN INVALID"), "{value}");
+
+        let bad = render_item(0, "5e81", ItemRead::Value("490154203237519"));
+        assert!(bad.contains("LUHN INVALID"), "{bad}");
+
+        let none = render_item(1, "5e82", ItemRead::NotProvisioned);
+        assert!(none.contains("SIM 2"), "{none}");
+        assert!(none.contains("not provisioned"), "{none}");
+        assert!(!none.contains('='), "an absent identity is not a value: {none}");
+
+        let failed = render_item(2, "5e90", ItemRead::Failed("no 15-digit identity record"));
+        assert!(failed.contains("spare"), "{failed}");
+        assert!(failed.contains("no 15-digit identity record"), "{failed}");
     }
 
     #[test]

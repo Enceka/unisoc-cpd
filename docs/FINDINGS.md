@@ -315,3 +315,90 @@ every passing cfun.  With both fixed, an MO loopback submit delivered and
 was captured by the `+CMTI` path into the daemon's inbox, end to end
 under the daemon.
 
+## 15. The measurement tree answers without a header, and slot 2 has no IMEI
+
+_2026-09-21, Android side, the vendor RIL stopped for each window._
+
+### 15.1 A parser that looked for a header threw every reading away
+
+* **`AT+SPENGMD` answers with a bare payload line.**  `AT+SPENGMD=0,14,1`
+  comes back as `78,0-627264,0-5,0--9500,…` followed by `OK` — **no
+  `+SPENGMD:` prefix at all**.  The first version of the serving/neighbour
+  parsers looked for the word `SPENGMD` in the answer, so every real serving
+  cell and every neighbour list was discarded and printed as "not reported".
+  A gap where there is data is the one failure this module exists to prevent;
+  the fix is to take the first payload line and strip a header only if one is
+  there.
+* **The shapes, measured.**  LTE serving is 65 dash-separated fields, all zero
+  when the UE is camped on NR SA.  The LTE neighbour query answers eight
+  records of twelve comma-separated fields; the NR neighbour query answers
+  **column-wise**, eight columns of N (band, ARFCN, PCI, RSRP, RSRQ, SINR, and
+  two the helper ignores), with RSRP/RSRQ/SINR in hundredths.
+* **Corroboration, not assumption, for the NR serving positions.**  Group 9 of
+  `AT+SPENGMD=0,14,1` reads `0x28002`, which is exactly the CI `+C5GREG`
+  reports (`…,"A00028002",11`), and group 8 is the gNB id that CI is prefixed
+  with.  That is how indices 8 and 9 were confirmed rather than guessed.
+* **The serving record's SINR field stays unread.**  The Android helper reads
+  one at group 15 and the measured answer has `1` there (0.01 dB, not a
+  signal); the plausible value sits at group 5 and nothing corroborates it.
+  `+CESQ`'s SS-SINR measures the same quantity properly, so that is what the
+  panel uses, and the field is left empty rather than filled with a guess.
+* **`0` and "not reported" are different words.**  The neighbour parsers now
+  return `Option<Vec<…>>`: `Some(empty)` is "read, nothing in range", `None` is
+  "nobody could read this".  Printing `0` for the second kind is what put a lie
+  on the page in the first place.
+
+### 15.2 `AT+COPS?` on its own does not answer
+
+* Measured: the plain query answers `+COPS: 0` — mode only, no operator, no
+  AcT, which is why the operator field was empty.  The vendor RIL asks in all
+  three name formats in one command
+  (`AT+COPS=3,0;+COPS?;+COPS=3,1;+COPS?;+COPS=3,2;+COPS?`) and gets three
+  `+COPS:` lines back: long name, short name, numeric + AcT.  `operator status`
+  does the same now, and prefers the CP's own name over the MCC-MNC table.
+* `ATI` is not answered on this firmware (`+CME ERROR: 4`), and `AT+CGMR` is a
+  five-line version block (`Platform Version: …`, `BASE  Version: …`,
+  `HW Version: …`, a date).  The baseband bar takes the `BASE` line and the
+  whole block stays in the raw echo.
+
+### 15.3 There is no per-slot IMEI read, and slot 2 is unprovisioned
+
+* **The AT surface has exactly one IMEI.**  `AT+CGSN` and `AT+SPIMEI?` answer
+  with the primary card's 15 digits — compared, and the same value.  Every
+  per-slot form is refused: `AT+SPACTCARD=<n>;AT+CGSN` and `AT+SPIMEICHECK?`
+  with CME 65536014 ("not supported"), `AT+SPIMEI=<n>` with 21, `AT+CGSN=1|2|3`
+  and the bare `AT+SPIMEI` with 65536014, `AT+SPCARDINFO=<n>` (0..6 and two
+  other arities) with 50.  `AT+SPIMEICHECK` alone answers `+SPIMEICHECK: 0`, a
+  status flag rather than an identity.  (The CP does carry a
+  `%RSIMREQ: "IMEI"` request, but that is the CP asking the *AP* for an IMEI in
+  the virtual-SIM case — the other direction.)
+* **The diag items are the only path, and slot 2's is all zeros.**  `imei read`
+  over `/dev/sdiag_nr` answers for all three items, and 5e82 (SIM 2) and 5e90
+  (spare) are fifteen zeros: no second identity is provisioned on this unit,
+  which is why "IMEI1" has nothing to show.
+* **Fifteen zeros pass Luhn**, so the read-back's own validation cannot tell an
+  unprovisioned item from a value — and the panel showed `000000000000000`
+  beside the real IMEI.  `imei read` now reports an all-zero item as *not
+  provisioned*: a fact about the handset, kept apart from a value and from a
+  failed read.
+
+### 15.4 Probing etiquette, learned the hard way
+
+* **One owner, or the channel wedges.**  A probe that started a fresh process
+  per command saw `TIMEOUT` on nearly every query and finally `CHANNEL DOWN`;
+  the same commands answered at once as soon as one `serve` held the channel.
+  The SIPC contract is one reader that never closes, and it means it.
+* **A leftover daemon owns the socket and the channel.**  One probe measured
+  nothing because an earlier run's `serve` still held `cmd.sock`: the new
+  daemon refused to start and the client talked to the wedged old one.  Probe
+  scripts now take a state directory of their own and kill leftovers first.
+* **The UE falls off its registration within minutes of the RIL stopping.**
+  Right after the takeover `AT+SPQ5GNCELLEX` lists real neighbours (the serving
+  cell plus nine); minutes later it is `+CEREG: 1,0`, `+CSQ: 0,99` and
+  `+CME ERROR: 3`.  A measurement has to be taken in that window, and a zero
+  answer afterwards is the state, not the parser.
+* **Repeated stop/start of the RIL leaves the SIM states degraded** (`LOADED` →
+  `NOT_READY`, slot 2 slower to come back than slot 1).  Restarting
+  `vendor.ril-daemon` recovers slot 1 within ~25 s; a reboot is the clean way
+  back.
+
