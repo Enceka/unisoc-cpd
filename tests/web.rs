@@ -1,0 +1,113 @@
+//! W7 end to end: the web front-end against a running daemon on the fake CP.
+//!
+//! The page and the JSON API must answer while `serve` owns the channels;
+//! what they return is the daemon's own data, passed through.
+
+mod common;
+
+use common::*;
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+fn bin() -> &'static str {
+    env!("CARGO_BIN_EXE_unisoc-cpd")
+}
+
+fn http_try(port: u16, path: &str) -> Option<String> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+    write!(s, "GET {path} HTTP/1.1\r\nHost: bench\r\nConnection: close\r\n\r\n").ok()?;
+    let mut out = String::new();
+    s.read_to_string(&mut out).ok()?;
+    Some(out)
+}
+
+fn wait_for_daemon(socket: &Path) -> bool {
+    for _ in 0..50 {
+        if UnixStream::connect(socket).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+#[test]
+fn web_serves_the_page_and_the_daemons_state() {
+    let (master, slave) = pty_pair();
+    let _modem = fake_modem(master);
+    // Leak the fake modem for the process lifetime.
+    std::mem::forget(_modem);
+    let dir = scratch("web");
+    let profile = dir.join("pty.toml");
+    std::fs::write(&profile, profile_toml(&slave, None, "")).expect("write profile");
+    let socket = dir.join("state").join("cmd.sock");
+    let runs = dir.join("runs");
+    let state = dir.join("state");
+
+    let mut serve = Command::new(bin())
+        .args([
+            "--profile",
+            profile.to_str().unwrap(),
+            "--mode",
+            "native",
+            "--runs-dir",
+            runs.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "serve",
+            "--seconds",
+            "180",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn serve");
+    assert!(wait_for_daemon(&socket), "serve did not come up");
+
+    // A distinct port per test process, so parallel runs cannot collide.
+    let port = 21000 + (std::process::id() % 20000) as u16;
+    let web_log = std::fs::File::create(dir.join("web.log")).expect("create web.log");
+    let mut web = Command::new(bin())
+        .args([
+            "--profile",
+            profile.to_str().unwrap(),
+            "--socket",
+            socket.to_str().unwrap(),
+            "web",
+            &format!("127.0.0.1:{port}"),
+        ])
+        .stdout(web_log.try_clone().expect("clone log"))
+        .stderr(web_log.try_clone().expect("clone log"))
+        .spawn()
+        .expect("spawn web");
+
+    let mut page_ok = false;
+    let mut state_ok = false;
+    let mut dial_ok = false;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(200));
+        if let Some(body) = http_try(port, "/") {
+            page_ok |= body.contains("unisoc-cpd");
+        }
+        if let Some(body) = http_try(port, "/api/state") {
+            state_ok |= body.contains("\"at\"");
+        }
+        if let Some(body) = http_try(port, "/api/urc") {
+            dial_ok |= body.contains("urc");
+        }
+        if page_ok && state_ok && dial_ok {
+            break;
+        }
+    }
+    let _ = web.kill();
+    let _ = serve.kill();
+    let web_out = std::fs::read_to_string(dir.join("web.log")).unwrap_or_default();
+    assert!(page_ok, "the page did not load; web.log: {web_out}");
+    assert!(state_ok, "/api/state did not answer");
+    assert!(dial_ok, "/api/urc did not answer");
+}

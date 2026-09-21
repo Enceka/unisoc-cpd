@@ -17,6 +17,7 @@ pub mod link;
 pub mod radio;
 pub mod serve;
 pub mod side;
+pub mod web;
 
 use crate::context::Context;
 use anyhow::{bail, Result};
@@ -88,6 +89,7 @@ pub fn find(name: &str) -> Option<Box<dyn Capability>> {
         Box::new(side::Nv),
         Box::new(side::Diag),
         Box::new(serve::Serve),
+        Box::new(web::Web),
     ];
     all.into_iter().find(|c| c.name() == name)
 }
@@ -95,7 +97,7 @@ pub fn find(name: &str) -> Option<Box<dyn Capability>> {
 pub fn catalogue() -> Vec<(&'static str, &'static str, bool)> {
     let names = [
         "at", "link", "sim", "cfun", "register", "signal", "operator", "band", "nr", "ims",
-        "sms", "ussd", "call", "data", "imei", "nv", "diag", "serve",
+        "sms", "ussd", "call", "data", "imei", "nv", "diag", "serve", "web",
     ];
     names
         .iter()

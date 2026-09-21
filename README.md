@@ -34,7 +34,7 @@ unisoc-cpd                     one binary, one profile
 
 ```sh
 cargo build --release          # host
-cargo test                     # 104 tests, no device needed
+cargo test                     # 119 tests, no device needed
 ```
 
 The tests run against a fake CP on a **pty**, which is the only honest stand-in
@@ -70,6 +70,7 @@ unisoc-cpd --profile e5 --mode native band status
 unisoc-cpd --profile e5 --mode native band lock nr 78
 unisoc-cpd --profile e5 --mode vendor register               # vendor baseline
 unisoc-cpd --profile e5 --mode native nv list                # read-only
+unisoc-cpd --socket /run/unisoc-cpd/cmd.sock web 0.0.0.0:8080  # W7: the browser face
 ```
 
 `--mode vendor` runs the command the profile names for that capability and
@@ -159,7 +160,7 @@ systemctl stop e5-mobile-data-watch e5-mobile-data e5-atd
 
 | | |
 |---|---|
-| core (channel/at/telemetry/profile/CLI) | implemented, 104 tests green |
+| core (channel/at/telemetry/profile/CLI) | implemented, 119 tests green |
 | capabilities | `link`, `sim`, `register`, `signal`, `operator`, `cfun`, `band`, `nr`, `ims`, `sms`, `ussd`, `call`, `data`, `nv`, `diag`, `serve` |
 | URC decoding (contracts §9.2) | implemented and tested; `+ECIND:`/`+CMT:`/`+CDS:` deliberately kept raw rather than half-decoded |
 | G2 control plane (`serve`) | code and offline tests in place: resident ownership, URC events, capabilities over a socket, idle probes, `state` with `last_ok_age_s`. **Not yet on the device** — it has not been the owner of `/dev/stty_nr1` |
@@ -169,7 +170,8 @@ systemctl stop e5-mobile-data-watch e5-mobile-data e5-atd
 | on-device, read-only | verified on the handset: `diag spools` (8 nodes, all `char`), `diag mailbox`, `diag asserts` (0 CP asserts), `nv list` (7 partitions). Each run's summary shows `at.commands: 0` and `channels.cmd.opens: 0` — the AT channel is deliberately not touched while the vendor RIL owns it |
 | on-device, AT | **measured on the Android side** (2026-09-20): after `stop vendor.ril-daemon` the daemon was the only reader of both channels — `link`, `sim`, `band`, `serve` + socket clients all passed with 0 CP asserts and 50/50 URC lines decoded; the transfer rule and the stack cold-cycle requirement are in FINDINGS §1–§2. **Not yet at boot on the Linux side**, not soaked, no profile is `verified` |
 | log/dump spool drains, `stime_ch` | not implemented (W1, still open) |
-| voice | no audio route yet (`voice.supported = false`); the signaling half is probed: `ims status` reads `+CIREG` (the IMS-registration gate), `call` dials/answers/hangs up signal-only without an audio route — the on-device reachability session is the next step (W4/W5) |
+| voice | no audio route yet (`voice.supported = false`); the signaling half is measured — `ims status` reads `+CIREG` (the IMS-registration gate), `call` dials/answers/hangs up signal-only; **first MT VoLTE call answered under the daemon** (FINDINGS §14) |
+| W7 web UI | `web` serves the daemon over HTTP: inbox, SMS send, dial/answer/hangup, live URC stream, incoming-call banner — a socket client, never a channel owner (`units/unisoc-cpd-web.service`) |
 
 ## Licence
 

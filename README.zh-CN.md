@@ -40,7 +40,7 @@ unisoc-cpd / ucpd              一个二进制，一份 profile
 
 ```sh
 cargo build --release        # 主机
-cargo test                   # 104 个测试，不需要设备
+cargo test                   # 119 个测试，不需要设备
 ```
 
 测试跑在一个 **pty 上的伪 CP** 上。pty 是 SIPC tty 唯一诚实的替身：真 tty、两端、驱动按突发交付行。伪 CP 会在**每一条应答里插入一条 URC**，所以"URC 与应答分流"、"限速"、"超时"、`>` 续行提示符这四条路径**每条命令都会被走到**，而不是只在顺利路径上被走到。
@@ -243,7 +243,7 @@ systemctl stop e5-mobile-data-watch e5-mobile-data e5-atd
 
 | 项目 | 状态 |
 |---|---|
-| 核心（channel / at / telemetry / profile / CLI） | 已实现，104 个测试通过 |
+| 核心（channel / at / telemetry / profile / CLI） | 已实现，119 个测试通过 |
 | `profile-check`（A12 门禁） | 通过（两个 profile，核心无平台名） |
 | URC 解码（契约 §9.2） | 已实现并测试；`+ECIND:`/`+CMT:`/`+CDS:` 有意保持原样，不解码就不假装解码 |
 | **G2 控制面（`serve`）** | 代码与离线测试就绪：常驻独占两条通道、URC 事件、socket 上的能力请求、空闲探活、`state`（含 `last_ok_age_s`）。**未上真机**——还没当过 `/dev/stty_nr1` 的主人 |
@@ -251,7 +251,8 @@ systemctl stop e5-mobile-data-watch e5-mobile-data e5-atd
 | **真机只读验证** | ✅ 已做：`diag spools`（8 个节点，全部 `char`）、`diag mailbox`、`diag asserts`（0 次 assert）、`nv list`（7 个分区）。每次运行的摘要都显示 `at.commands: 0`、`channels.cmd.opens: 0`，即**全程没有打开过 AT 通道** |
 | **真机接管 AT** | ✅ **Android 侧已做**（2026-09-20）：`stop vendor.ril-daemon` 后守护进程成为两条通道的唯一读者，`link`/`sim`/`band`/`serve`+socket 全部实测通过，0 次 CP assert，URC 解码 50/50；交接规程与栈冷启动要求见 FINDINGS §1–§2。Linux 侧还没在开机时当过主人，没跑过浸泡，profile 仍 `verified = false` |
 | log/dump spool 排空、`stime_ch` | ❌ 未实现（W1 遗留） |
-| 语音 CS | 音频路由仍无（`voice.supported = false`）；信令一半已可探测：`ims status` 读 `+CIREG`（IMS 注册门禁），`call` 在无音频路由时也能做纯信令拨/接/挂——下一步是真机可达性实验（W4/W5） |
+| 语音 CS | 音频路由仍无（`voice.supported = false`）；信令一半已实测——`ims status` 读 `+CIREG`（IMS 注册门禁），`call` 纯信令拨/接/挂；**守护进程之下的第一通 VoLTE 来电已接通**（FINDINGS §14） |
+| W7 web 界面 | `web` 已落地：浏览器收发短信、接打电话、实时 URC 事件流、来电全屏横幅——只是 socket 客户端，绝不碰通道（`units/unisoc-cpd-web.service`） |
 
 ## 11. AT 指令的来源
 

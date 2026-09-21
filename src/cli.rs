@@ -134,7 +134,10 @@ pub fn run(cli: Cli) -> Result<i32> {
     // `serve` holds the port.  `serve` is the exception: for it, `--socket` is
     // where to listen, so it goes down the direct path.
     if let Some(socket) = &cli.socket {
-        if cli.capability != "serve" {
+        // `web` is the other exception: like `serve`, it is a front-end that
+        // must run here, not a request to forward -- it drives the daemon,
+        // never the channels.
+        if !matches!(cli.capability.as_str(), "serve" | "web") {
             if mode == Mode::Vendor {
                 bail!("--socket asks our own daemon; a vendor run has no socket to ask");
             }
@@ -187,7 +190,16 @@ pub fn run(cli: Cli) -> Result<i32> {
         let Some(cap) = capability::find(&capability_name) else {
             bail!("unknown capability '{capability_name}'; try `unisoc-cpd capabilities`");
         };
-        cap.run(&mut ctx, &cli.args)?
+        let mut cap_args = cli.args.clone();
+        if capability_name == "web" {
+            if let Some(socket) = &cli.socket {
+                if !cap_args.iter().any(|a| a == "--socket" || a.starts_with("--socket=")) {
+                    cap_args.push("--socket".into());
+                    cap_args.push(socket.display().to_string());
+                }
+            }
+        }
+        cap.run(&mut ctx, &cap_args)?
     };
 
     let exit_code = match outcome.status {
