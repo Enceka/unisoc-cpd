@@ -285,6 +285,8 @@ fn respond(
             "+CMGR: \"REC UNREAD\",\"+8613800138000\",,\"26/09/20,10:00:00+32\"\r\nhello from index {index}\r\nOK\r\n"
         )
         .into()
+    } else if upper.starts_with("AT+CMGD") {
+        "OK\r\n".into()
     } else if upper.starts_with("AT+CMGL") {
         "+CMGL: 1,\"REC READ\",\"+8613800138000\",,\"26/09/20,10:00:00+32\"\r\nhello\r\nOK\r\n"
             .into()

@@ -180,6 +180,21 @@ fn route(stream: &mut TcpStream, method: &str, path: &str, body: &str, socket: &
                 respond_json(stream, &run_cap(socket, "at", &[cmd.as_str()]));
             }
         }
+        ("POST", "/api/sms-delete") => {
+            // `AT+CMGD=<index>` deletes out of whichever storage `+CPMS`
+            // currently selects, so the index alone is what the AT surface
+            // takes.  The message's storage is shown next to the button
+            // precisely because the two can differ, and the list is re-read
+            // afterwards rather than assumed.
+            let index = form_value(body, "index").unwrap_or_default().trim().to_string();
+            if index.is_empty()
+                || !(index.chars().all(|c| c.is_ascii_digit()) || index.eq_ignore_ascii_case("all"))
+            {
+                respond_json(stream, &json!({ "ok": false, "status": "error", "error": "an index (or ALL) is required" }));
+            } else {
+                respond_json(stream, &run_cap(socket, "sms", &["delete", index.as_str()]));
+            }
+        }
         ("POST", "/api/send") => {
             let to = form_value(body, "to").unwrap_or_default();
             let text = form_value(body, "text").unwrap_or_default();
@@ -793,10 +808,14 @@ EARFCN <input id="cell-freq" size="9" autocomplete="off"> PCI <input id="cell-pc
 <button class="red" onclick="imeiWrite()">写入 IMEI</button>
 <pre id="imei-out">…</pre></details>
 
-<h2>短信 · inbox</h2><div id="msgs">…</div>
-<h2>发短信</h2>
+<details id="d-sms" open><summary>短信 · inbox（单条删除）</summary>
+<div id="msgs">…</div>
+<h2 style="font-size:14px">发短信</h2>
 <div><input id="to" placeholder="+86…" size="14"> <input id="text" placeholder="内容" size="24">
 <button onclick="sendSms()">发送</button></div><pre id="sms-out"></pre>
+<div class="hist">删除按索引提交，落在 CP 当前选中的存储上（+CPMS）；每行标出的存储是这条消息
+被读到时所在的存储，两者不一致时以删除后重新列出的结果为准。</div>
+</details>
 
 <h2>电话</h2>
 <div><input id="num" placeholder="号码" size="14">
@@ -815,7 +834,10 @@ NV 命令）会立刻并可能永久改变基带配置 / NV，写错可能失联
 <pre id="at-out">…</pre>
 <div id="at-hist"></div>
 
-<h2>事件流（urc）</h2><pre id="urc-out">…</pre>
+<h2>事件流（urc） <button onclick="clearUrc()">清空显示</button>
+<button onclick="showAllUrc()">显示全部</button></h2>
+<div class="hist" id="urc-note"></div>
+<pre id="urc-out">…</pre>
 <h2>状态详情</h2><pre id="stat-out">…</pre>
 
 <script>
@@ -869,8 +891,26 @@ function fmtUrc(u){ const o = u.urc;
 function isRing(u){ const o=u.urc;
   if(o&&typeof o==='object') return o.kind==='urc-incoming-call';
   return typeof o==='string' && o.indexOf('+CRING')===0; }
+var urcWatermark = null;
+var urcLast = [];
+function refreshUrcNote(){
+  document.getElementById('urc-note').textContent = urcWatermark
+    ? ('已清空显示：水位线 ' + urcWatermark + '（只隐藏本页，daemon 的缓冲没动）')
+    : '';
+}
+function clearUrc(){
+  // The watermark is the newest event already on screen: clearing is a
+  // display filter in this page, and the daemon's ring keeps every event.
+  if(urcLast.length) urcWatermark = urcLast[urcLast.length-1].at;
+  refreshUrcNote(); refreshUrc();
+}
+function showAllUrc(){ urcWatermark = null; refreshUrcNote(); refreshUrc(); }
 async function refreshUrc(){ try{ const d = await get('/api/urc'); const us = d.urcs||[];
-  document.getElementById('urc-out').textContent = us.map(fmtUrc).join('\n');
+  urcLast = us;
+  const shown = urcWatermark ? us.filter(function(u){ return u.at > urcWatermark; }) : us;
+  document.getElementById('urc-out').textContent = shown.map(fmtUrc).join('\n');
+  // The incoming-call banner reads the unfiltered list: silencing a ringer is
+  // not what "clear the log" means.
   const ring = us.filter(isRing);
   const b = document.getElementById('banner');
   if(ring.length){ if(b.style.display!=='block'){ b.style.display='block';
@@ -880,10 +920,19 @@ async function refreshUrc(){ try{ const d = await get('/api/urc'); const us = d.
  }catch(e){} }
 async function refreshMsgs(){ try{ const d = await get('/api/messages'); const ms = d.messages||[];
   document.getElementById('msgs').innerHTML = ms.map(function(m){
-   return '<div class="msg"><span class="from">'+m.from+'</span> '
-    +(m.timestamp||'')+'<br>'+ (m.text||'').replace(/&/g,'&amp;').replace(/</g,'&lt;') +'</div>';}).join('')
+   return '<div class="msg"><span class="from">'+esc(m.from)+'</span> '
+    + esc((m.storage||'')+'['+m.index+'] '+(m.timestamp||''))
+    + '<button class="red" style="float:right;padding:2px 8px;font-size:12px"'
+    + ' onclick="delSms('+m.index+')">删除</button>'
+    + '<br>'+esc(m.text||'')+'</div>';}).join('')
    || '（空）';
  }catch(e){} }
+async function delSms(index){
+  // A delete is the one thing here that changes what is stored on the SIM or
+  // in the modem, so it asks first.
+  if(!window.confirm('删除索引 '+index+' 这条短信？（落在 CP 当前选中的存储上，不可撤销）')) return;
+  out('sms-out', await post('/api/sms-delete', {index: index}));
+  refreshMsgs(); }
 async function sendSms(){ const r = await post('/api/send',
   {to:document.getElementById('to').value, text:document.getElementById('text').value});
  out('sms-out', r); refreshMsgs(); }

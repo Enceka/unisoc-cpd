@@ -114,6 +114,7 @@ fn web_serves_the_page_and_the_daemons_state() {
     let mut band_lock_ok = false;
     let mut rejected_ok = false;
     let mut imei_guard_ok = false;
+    let mut sms_delete_ok = false;
     let mut cell_lock_ok = false;
     for _ in 0..50 {
         std::thread::sleep(Duration::from_millis(200));
@@ -189,6 +190,15 @@ fn web_serves_the_page_and_the_daemons_state() {
                 }
             }
         }
+        if !sms_delete_ok {
+            if let Some(body) = http_post_try(port, "/api/sms-delete", "index=2") {
+                sms_delete_ok |= body.contains("\"status\":\"pass\"");
+            }
+            // A non-index must never reach the AT surface.
+            if let Some(body) = http_post_try(port, "/api/sms-delete", "index=abc") {
+                sms_delete_ok &= body.contains("an index");
+            }
+        }
         if !imei_guard_ok {
             // The rig's profile declares no write contract, so a correctly
             // confirmed write must get *past* the page's guard and be refused
@@ -231,6 +241,7 @@ fn web_serves_the_page_and_the_daemons_state() {
             && cell_lock_ok
             && rejected_ok
             && imei_guard_ok
+            && sms_delete_ok
         {
             break;
         }
@@ -254,4 +265,5 @@ fn web_serves_the_page_and_the_daemons_state() {
         imei_guard_ok,
         "an identity write did not pass the page's guard into the capability's own"
     );
+    assert!(sms_delete_ok, "a SMS delete did not reach the daemon as an index");
 }
