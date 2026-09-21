@@ -191,6 +191,8 @@ struct ModemState {
     locked_cell: Option<(u32, u32)>,
     sa: u32,
     volte: u32,
+    /// The APN a `AT+CGDCONT=` write left in context 1, for the read-back.
+    cgdcont_apn: Option<String>,
 }
 
 fn respond(
@@ -300,7 +302,33 @@ fn respond(
         "+CGACT: 1,1\r\nOK\r\n".into()
     } else if upper.starts_with("AT+CGCONTRDP") {
         "+CGCONTRDP: 1,5,\"3gnet\",\"10.105.136.142.255.0.0.0\",\"10.0.0.1\",\"58.240.57.33\",\"221.6.4.66\"\r\nOK\r\n".into()
-    } else if upper.starts_with("AT+CGDCONT") || upper.starts_with("AT+CGACT") {
+    } else if upper.starts_with("AT+CGDCONT?") {
+        // The modem's own contexts: cid 1 carries whatever a write left there
+        // (or the default), cid 2 exists and names nothing.
+        let apn = state
+            .cgdcont_apn
+            .clone()
+            .unwrap_or_else(|| "3gnet".to_string());
+        format!(
+            "+CGDCONT: 1,\"IPV4V6\",\"{apn}\",\"0.0.0.0.0.0.0.0\",0,0,0,0\r\n\
+             +CGDCONT: 2,\"IPV4V6\",\"\",\"0.0.0.0.0.0.0.0\",0,0,0,0\r\nOK\r\n"
+        )
+        .into()
+    } else if upper.starts_with("AT+CGDCONT=") {
+        // `AT+CGDCONT=<cid>,"IPV4V6","<apn>"` sets the context and
+        // `AT+CGDCONT=<cid>` alone clears it, so a read-back can be checked.
+        // The fields come out of the *original* command, not the uppercased
+        // one: an APN is case-sensitive on the wire, and a modem that folded
+        // the case would be a different modem.
+        let args = cmd.split_once('=').map(|(_, rest)| rest).unwrap_or("");
+        state.cgdcont_apn = args
+            .split(',')
+            .map(|f| f.trim().trim_matches('"'))
+            .skip(2)
+            .find(|f| !f.is_empty())
+            .map(|apn| apn.to_string());
+        "OK\r\n".into()
+    } else if upper.starts_with("AT+CGACT") {
         "OK\r\n".into()
     } else if upper.starts_with("AT+CGDATA") {
         "CONNECT\r\n".into()

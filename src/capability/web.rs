@@ -135,6 +135,33 @@ fn route(stream: &mut TcpStream, method: &str, path: &str, body: &str, socket: &
         ("GET", "/api/metrics") => respond_json(stream, &api_metrics(socket)),
         ("GET", "/api/identity") => respond_json(stream, &api_identity(socket)),
         ("GET", "/api/network") => respond_json(stream, &api_network(socket)),
+        ("GET", "/api/apn") => respond_json(stream, &api_apn(socket)),
+        ("POST", "/api/apn-set") => match apn_request(body) {
+            Ok((apn, cid)) => {
+                let cid = cid.to_string();
+                respond_json(
+                    stream,
+                    &run_cap(socket, "data", &["set-apn", apn.as_str(), "--cid", cid.as_str()]),
+                );
+            }
+            Err(e) => respond_json(stream, &json!({ "ok": false, "status": "error", "error": e })),
+        },
+        ("POST", "/api/apn-save") => match apn_request(body) {
+            Ok((apn, _)) => respond_json(stream, &run_cap(socket, "data", &["save-apn", apn.as_str()])),
+            Err(e) => respond_json(stream, &json!({ "ok": false, "status": "error", "error": e })),
+        },
+        ("POST", "/api/apn-clear") => {
+            let cid = form_value(body, "cid").unwrap_or_default();
+            let cid = cid.trim().to_string();
+            if cid.is_empty() || !cid.chars().all(|c| c.is_ascii_digit()) {
+                respond_json(stream, &json!({ "ok": false, "status": "error", "error": "cid must be a number" }));
+            } else {
+                respond_json(
+                    stream,
+                    &run_cap(socket, "data", &["clear-apn", "--cid", cid.as_str()]),
+                );
+            }
+        }
         ("GET", "/api/bands") => respond_json(stream, &api_band_state(socket)),
         ("GET", "/api/cells") => respond_json(stream, &api_band_state(socket)),
         ("POST", "/api/band-lock") => match band_request(body) {
@@ -332,6 +359,61 @@ fn neighbor_entry(line: &str) -> Value {
         map.insert(key.to_string(), value);
     }
     Value::Object(map)
+}
+
+/// The APN panel: what the bearer would use, where that came from, what the
+/// override file says, and the modem's own contexts -- which are three
+/// different places, which is why they are reported side by side.
+fn api_apn(socket: &Path) -> Value {
+    let answer = run_cap(socket, "data", &["contexts"]);
+    let out = output_lines(&answer);
+    let contexts: Vec<Value> = summary_all(&out, "context")
+        .iter()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(',').map(|f| f.trim()).collect();
+            let cid = fields.first()?.parse::<u32>().ok()?;
+            let field = |i: usize| {
+                fields
+                    .get(i)
+                    .filter(|v| !v.is_empty() && **v != "-")
+                    .map(|v| v.to_string())
+            };
+            Some(json!({
+                "cid": cid,
+                "pdp_type": field(1),
+                "apn": field(2),
+                "state": field(3),
+            }))
+        })
+        .collect();
+    json!({
+        "apn": summary(&out, "apn"),
+        "apn_source": summary(&out, "apn_source"),
+        "saved_apn": summary(&out, "saved_apn"),
+        "apn_source_path": summary(&out, "apn_source_path"),
+        "cid": summary(&out, "cid").and_then(|v| v.parse::<u32>().ok()),
+        "contexts": contexts,
+        "status": answer.get("status"),
+        "error": answer.get("error"),
+    })
+}
+
+/// The APN form: a value, and the context to write it to.
+///
+/// The value is validated by the capability that builds the AT command (a
+/// quote or a comma would make the command something else), so what is checked
+/// here is only what the page needs to have a form at all.
+fn apn_request(body: &str) -> Result<(String, u32), String> {
+    let apn = form_value(body, "apn").unwrap_or_default().trim().to_string();
+    if apn.is_empty() {
+        return Err("an APN is required".to_string());
+    }
+    let cid = form_value(body, "cid").unwrap_or_default().trim().to_string();
+    let cid = if cid.is_empty() { "1".to_string() } else { cid };
+    match cid.parse::<u32>() {
+        Ok(cid) if cid > 0 => Ok((apn, cid)),
+        _ => Err(format!("cid must be a positive number, got {cid:?}")),
+    }
 }
 
 /// The locked bands and cells, out of `band status`.
@@ -789,6 +871,19 @@ const PAGE: &str = r#"<!doctype html>
 <button onclick="loadIdentity()">刷新</button>
 <div class="kv" id="identity">展开后读取…</div></details>
 
+<details id="d-apn"><summary>APN 管理（解析结果 · Modem 上下文 · 覆盖文件）</summary>
+<button onclick="loadApn()">刷新</button>
+<div class="warn">⚠️ APN 有三个地方，别混：① <b>Modem 的 PDP 上下文</b>——承载真正用的是它；
+② <b>覆盖文件</b>——解析顺序里排在 Modem 前面，重启后仍然生效；③ SIM/表的兜底——不可写。
+写入 Modem 后要重建承载才生效（<code>data down</code> 再 <code>data up</code>）；保存到覆盖文件则要重跑承载服务。</div>
+<div class="kv" id="apn-state">展开后读取…</div>
+<div>新 APN <input id="apn-value" size="16" autocomplete="off">
+CID <select id="apn-cid"></select>
+<button onclick="apnSet()">写入 Modem</button>
+<button onclick="apnSave()">保存到覆盖文件</button>
+<button class="red" onclick="apnClear()">清除上下文</button></div>
+<pre id="apn-out">…</pre></details>
+
 <details id="d-metrics"><summary>信号详情（RSSI / RSRP / RSRQ / 频率 / 频宽 / PCI / 小区ID · 邻区）</summary>
 <button onclick="loadMetrics()">刷新</button>
 <div class="kv" id="metrics">展开后读取…（要探测测量类 AT，可能较慢）</div></details>
@@ -1110,11 +1205,47 @@ function lockNeighbor(rat, freq, pci){
   document.getElementById('cell-freq').value = freq;
   document.getElementById('cell-pci').value = pci;
 }
+async function loadApn(){
+  const el = document.getElementById('apn-state'); el.textContent = '读取中…';
+  try{ const d = await get('/api/apn'); let h = '';
+    h += kv('承载会用的 APN', d.apn ? (d.apn + '（来源：' + (d.apn_source||'?') + '）') : null);
+    h += kv('覆盖文件', d.saved_apn ? d.saved_apn : '未固定（文件里的 APN= 仍是注释）');
+    h += kv('覆盖文件路径', d.apn_source_path);
+    h += kv('默认 CID', d.cid);
+    (d.contexts||[]).forEach(function(c){
+      h += '<div><b>CID '+c.cid+'</b>'+(c.apn ? esc(c.apn) : '（无 APN）')
+        + (c.pdp_type ? ' · '+esc(c.pdp_type) : '') + (c.state ? ' · '+esc(c.state) : '') + '</div>'; });
+    el.innerHTML = h;
+    // The contexts the CP actually has, so the CID is picked rather than
+    // typed: the device carries more than one (data and IMS), and a typo here
+    // would write an APN into a context nobody uses.
+    const sel = document.getElementById('apn-cid');
+    if(sel){
+      const cids = (d.contexts||[]).map(function(c){ return c.cid; });
+      if(d.cid!=null && cids.indexOf(d.cid)<0) cids.unshift(d.cid);
+      sel.innerHTML = cids.map(function(c){ return '<option value="'+c+'">'+c+'</option>'; }).join('');
+      if(d.cid!=null) sel.value = String(d.cid);
+    }
+    const v = document.getElementById('apn-value');
+    if(!v.value && d.apn) v.value = d.apn;
+  }catch(e){ el.textContent = '读取失败: '+e; } }
+async function apnSet(){
+  const apn = document.getElementById('apn-value').value.trim(); if(!apn) return;
+  out('apn-out', await post('/api/apn-set', {apn:apn, cid:document.getElementById('apn-cid').value}));
+  loadApn(); }
+async function apnSave(){
+  const apn = document.getElementById('apn-value').value.trim(); if(!apn) return;
+  out('apn-out', await post('/api/apn-save', {apn:apn})); loadApn(); }
+async function apnClear(){
+  if(!window.confirm('清除 Modem 的 PDP 上下文定义？清空后承载没有 APN 可用，直到重新设置。')) return;
+  out('apn-out', await post('/api/apn-clear', {cid:document.getElementById('apn-cid').value}));
+  loadApn(); }
 function lazyLoad(){
   quickBands();
   document.getElementById('d-identity').addEventListener('toggle', function(){ if(this.open) loadIdentity(); });
   document.getElementById('d-metrics').addEventListener('toggle', function(){ if(this.open) loadMetrics(); });
   document.getElementById('d-network').addEventListener('toggle', function(){ if(this.open) loadNetwork(); });
+  document.getElementById('d-apn').addEventListener('toggle', function(){ if(this.open) loadApn(); });
   document.getElementById('d-bands').addEventListener('toggle', function(){ if(this.open) loadLocks(); });
   document.getElementById('d-cells').addEventListener('toggle', function(){ if(this.open) loadLocks(); });
   document.getElementById('d-imei').addEventListener('toggle', function(){ if(this.open) loadIdentity(); });
@@ -1376,6 +1507,19 @@ mod tests {
             unit.contains(&format!(":{port}")),
             "the web unit does not listen on :{port}:\n{unit}"
         );
+    }
+
+    #[test]
+    fn an_apn_request_needs_a_value_and_a_context() {
+        assert_eq!(apn_request("apn=cbnet").unwrap(), ("cbnet".to_string(), 1));
+        assert_eq!(
+            apn_request("apn=cbnet&cid=3").unwrap(),
+            ("cbnet".to_string(), 3)
+        );
+        assert!(apn_request("").is_err(), "no APN");
+        assert!(apn_request("apn=%20").is_err(), "a blank APN is no APN");
+        assert!(apn_request("apn=cbnet&cid=0").is_err(), "cid 0 is not a context");
+        assert!(apn_request("apn=cbnet&cid=x").is_err());
     }
 
     #[test]

@@ -5,9 +5,9 @@
 //! Anything that is genuinely platform-shaped — the NAT table, a LED, a QMI
 //! bridge — is a `vendor`-mode command or a profile hook, never a `#ifdef`.
 
-use super::{emit, positionals, Capability, Outcome};
+use super::{emit, flag_value, positionals, Capability, Outcome};
 use crate::context::Context;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
 use std::net::Ipv4Addr;
 use std::process::Command;
 use std::time::Duration;
@@ -156,10 +156,117 @@ pub fn cgdcont_apn(reply: &crate::at::Reply, cid: u32) -> Option<String> {
     None
 }
 
+/// One PDP context, as `AT+CGDCONT?` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApnContext {
+    pub cid: u32,
+    pub pdp_type: String,
+    pub apn: String,
+}
+
+/// Every context in an `AT+CGDCONT?` reply:
+/// `+CGDCONT: <cid>,"<pdp type>","<apn>",...`.  A context with no APN is a
+/// context that exists and names nothing, which is a different fact from a
+/// context that is not there -- so it is kept, with an empty name.
+pub fn parse_cgdcont_all(reply: &crate::at::Reply) -> Vec<ApnContext> {
+    let mut out = Vec::new();
+    for line in &reply.lines {
+        let Some(body) = line.trim().strip_prefix("+CGDCONT:") else {
+            continue;
+        };
+        let fields: Vec<String> = body
+            .split(',')
+            .map(|f| f.trim().trim_matches('"').to_string())
+            .collect();
+        let Some(cid) = fields.first().and_then(|c| c.parse::<u32>().ok()) else {
+            continue;
+        };
+        out.push(ApnContext {
+            cid,
+            pdp_type: fields.get(1).cloned().unwrap_or_default(),
+            apn: fields.get(2).cloned().unwrap_or_default(),
+        });
+    }
+    out
+}
+
+/// Which contexts are up, out of `AT+CGACT?`: `+CGACT: <cid>,<state>`.
+pub fn parse_cgact(reply: &crate::at::Reply) -> Vec<(u32, u32)> {
+    reply
+        .lines
+        .iter()
+        .filter_map(|line| {
+            let body = line.trim().strip_prefix("+CGACT:")?;
+            let mut it = body.split(',').map(|f| f.trim());
+            let cid = it.next()?.parse::<u32>().ok()?;
+            let state = it.next()?.parse::<u32>().ok()?;
+            Some((cid, state))
+        })
+        .collect()
+}
+
+/// An APN as it goes into an AT command: inside quotes, which is why a value
+/// carrying a quote, a comma or a space is refused rather than escaped.  An
+/// APN someone meant to type never contains one of those, and a command built
+/// out of one would not be the command they think they asked for.
+pub fn apn_argument(raw: Option<&String>) -> anyhow::Result<String> {
+    let Some(raw) = raw else {
+        anyhow::bail!("this action needs an APN, e.g. `data set-apn cbnet`");
+    };
+    let apn = raw.trim().to_string();
+    if apn.is_empty() || apn.len() > 100 {
+        anyhow::bail!("an APN must be 1..100 characters, got {apn:?}");
+    }
+    if apn
+        .chars()
+        .any(|c| c == '"' || c == ',' || c.is_whitespace() || c == '\r' || c == '\n')
+    {
+        anyhow::bail!(
+            "an APN cannot contain a quote, a comma or a space (got {apn:?}); \
+             the value goes into AT+CGDCONT inside quotes"
+        );
+    }
+    Ok(apn)
+}
+
+/// Rewrite the `APN=` line of a shell-style config file.
+///
+/// Everything else -- comments, other keys, blank lines, and a commented
+/// `#APN=` template line -- is left exactly as it was, because that commented
+/// line is the file's documented "not pinned" state and the comments are where
+/// the resolution order is written down.  A second active `APN=` line would be
+/// ambiguous, so it is dropped rather than left to win by position.
+///
+/// Pure, so the rewriting is testable without touching a filesystem.
+pub fn upsert_apn(text: &str, apn: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut written = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            lines.push(line.to_string());
+            continue;
+        }
+        if trimmed.starts_with("APN=") {
+            if !written {
+                lines.push(format!("APN={apn}"));
+                written = true;
+            }
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+    if !written {
+        lines.push(format!("APN={apn}"));
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
 /// The home operator's APN, from the SIM's IMSI: the first three digits are the
 /// MCC, the rest the MNC (two or three digits, so the longest table key wins).
-pub fn imsi_apn(imsi: &str) -> Option<(String, String)> {
-    let digits: String = imsi.chars().filter(|c| c.is_ascii_digit()).collect();
+pub fn imsi_apn(imsi: &str) -> Option<(String, String)> {    let digits: String = imsi.chars().filter(|c| c.is_ascii_digit()).collect();
     if digits.len() < 5 {
         return None;
     }
@@ -217,13 +324,68 @@ pub fn resolve_apn(
     (None, "no source".to_string())
 }
 
+/// Pass or fail, from the lines and the verdict.
+fn outcome(lines: Vec<String>, ok: bool) -> Outcome {
+    if ok {
+        Outcome::pass(lines)
+    } else {
+        Outcome::fail(lines)
+    }
+}
+
+/// The APN given for a management action: the positional, or `--apn`.
+fn apn_raw(args: &[String], pos: &[String]) -> Option<String> {
+    pos.get(1)
+        .cloned()
+        .or_else(|| flag_value(args, "--apn").map(|s| s.to_string()))
+}
+
+/// What the profile's override file currently says, when it says anything.
+fn saved_apn(ctx: &Context) -> Option<String> {
+    ctx.profile
+        .data
+        .apn_source
+        .as_deref()
+        .and_then(apn_from_source)
+}
+
+/// The resolved APN and where it came from, as the summary lines the web panel
+/// reads -- plus the human-readable line the CLI prints.
+fn resolved_lines(out: &mut Vec<String>, apn: Option<String>, source: &str) {
+    match &apn {
+        Some(apn) => {
+            out.push(format!("APN {apn} (source: {source})"));
+            out.push(format!("apn: {apn}"));
+        }
+        None => {
+            out.push(format!("no APN found ({source})"));
+            out.push("apn: -".to_string());
+        }
+    }
+    out.push(format!("apn_source: {source}"));
+}
+
+/// A summary value, with `-` for "nothing here".
+fn or_dash(value: Option<String>) -> String {
+    value.filter(|v| !v.is_empty()).unwrap_or_else(|| "-".to_string())
+}
+
+fn or_dash_value(value: &str) -> String {
+    if value.is_empty() {
+        "-".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 impl Capability for Data {
     fn name(&self) -> &'static str {
         "data"
     }
 
     fn summary(&self) -> &'static str {
-        "PDP context and bearer interface: up [apn] | down | status | apn"
+        "PDP context and bearer: up [apn] | down | status | apn | contexts | \
+         set-apn <apn> | clear-apn | save-apn <apn>"
     }
 
     fn run(&self, ctx: &mut Context, args: &[String]) -> Result<Outcome> {
@@ -301,11 +463,144 @@ impl Capability for Data {
                     ctx.profile.data.apn_source.as_deref(),
                 );
                 let mut out = Vec::new();
-                match apn {
-                    Some(a) => out.push(format!("APN {a} (source: {source})")),
-                    None => out.push(format!("no APN found ({source})")),
-                }
+                resolved_lines(&mut out, apn, &source);
+                out.push(format!("saved_apn: {}", or_dash(saved_apn(ctx))));
                 Ok(Outcome::pass(out))
+            }
+            // ------------------------------------------------------- management
+            //
+            // Three places can hold an APN, and they are not the same place:
+            // the modem's own context (what the bearer actually uses), this
+            // profile's override file (what the resolution order reads before
+            // the modem), and the SIM/table fallback (which is nobody's to
+            // write).  The panel reads all three and writes the two that can be
+            // written -- each with a read-back, because a write that did not
+            // take must not look like one.
+            "contexts" => {
+                let session = ctx.at()?;
+                let mut out = Vec::new();
+                let cgd = session.command("AT+CGDCONT?", Duration::from_secs(8), &[], 0);
+                let act = session.command("AT+CGACT?", Duration::from_secs(8), &[], 0);
+                emit(&mut out, "AT+CGDCONT?", &cgd);
+                emit(&mut out, "AT+CGACT?", &act);
+
+                let contexts = parse_cgdcont_all(&cgd);
+                let active = parse_cgact(&act);
+                for context in &contexts {
+                    let state = active.iter().find(|(id, _)| *id == context.cid);
+                    out.push(format!(
+                        "context: {},{},{},{}",
+                        context.cid,
+                        or_dash_value(&context.pdp_type),
+                        or_dash_value(&context.apn),
+                        match state.map(|(_, s)| *s) {
+                            Some(1) => "active",
+                            Some(_) => "inactive",
+                            None => "unknown",
+                        }
+                    ));
+                }
+                out.push(format!("contexts: {}", contexts.len()));
+
+                let (apn, source) = resolve_apn(&session, cid, None, ctx.profile.data.apn_source.as_deref());
+                resolved_lines(&mut out, apn, &source);
+                out.push(format!("saved_apn: {}", or_dash(saved_apn(ctx))));
+                out.push(format!("cid: {cid}"));
+                out.push(format!(
+                    "apn_source_path: {}",
+                    ctx.profile.data.apn_source.clone().unwrap_or_else(|| "-".to_string())
+                ));
+                Ok(outcome(out, cgd.ok()))
+            }
+            "set-apn" => {
+                let apn = apn_argument(apn_raw(args, &pos).as_ref())?;
+                let cid = flag_value(args, "--cid")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(cid);
+                let session = ctx.at()?;
+                let mut out = Vec::new();
+                let cmd = format!("AT+CGDCONT={cid},\"IPV4V6\",\"{apn}\"");
+                let r = session.command(&cmd, Duration::from_secs(15), &[], 0);
+                emit(&mut out, &cmd, &r);
+                let back = session.command("AT+CGDCONT?", Duration::from_secs(8), &[], 0);
+                emit(&mut out, "AT+CGDCONT?", &back);
+                let applied = parse_cgdcont_all(&back)
+                    .into_iter()
+                    .find(|c| c.cid == cid)
+                    .map(|c| c.apn);
+                out.push(format!("apn: {apn}"));
+                out.push(format!(
+                    "context_{cid}_apn: {}",
+                    or_dash(applied.clone())
+                ));
+                let ok = r.ok() && applied.as_deref() == Some(apn.as_str());
+                if ok {
+                    ctx.event("apn-set", format!("cid {cid} {apn}"));
+                    out.push(
+                        "note: the context changed; the bearer only picks it up when it is \
+                         re-established (data down, then data up)"
+                            .to_string(),
+                    );
+                } else {
+                    ctx.note(format!(
+                        "context {cid} reads back as {:?}, not {apn:?}",
+                        applied
+                    ));
+                }
+                Ok(outcome(out, ok))
+            }
+            "clear-apn" => {
+                let cid = flag_value(args, "--cid")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(cid);
+                let session = ctx.at()?;
+                let mut out = Vec::new();
+                let cmd = format!("AT+CGDCONT={cid}");
+                let r = session.command(&cmd, Duration::from_secs(15), &[], 0);
+                emit(&mut out, &cmd, &r);
+                let back = session.command("AT+CGDCONT?", Duration::from_secs(8), &[], 0);
+                emit(&mut out, "AT+CGDCONT?", &back);
+                // Cleared means either the context is gone or it names nothing;
+                // both are "no APN here", and neither is a failure of the write.
+                let still = parse_cgdcont_all(&back)
+                    .into_iter()
+                    .find(|c| c.cid == cid)
+                    .map(|c| c.apn)
+                    .unwrap_or_default();
+                out.push(format!("context_{cid}_apn: -"));
+                let ok = r.ok() && still.is_empty();
+                if ok {
+                    ctx.event("apn-clear", format!("cid {cid}"));
+                } else {
+                    ctx.note(format!("context {cid} still reads back as {still:?}"));
+                }
+                Ok(outcome(out, ok))
+            }
+            "save-apn" => {
+                let apn = apn_argument(apn_raw(args, &pos).as_ref())?;
+                let mut out = Vec::new();
+                let Some(path) = ctx.profile.data.apn_source.clone() else {
+                    bail!(
+                        "profile {:?} names no [data].apn_source, so there is nowhere to \
+                         save an APN",
+                        ctx.profile.name
+                    );
+                };
+                let existing = std::fs::read_to_string(&path).unwrap_or_default();
+                std::fs::write(&path, upsert_apn(&existing, &apn))
+                    .with_context(|| format!("writing {path}"))?;
+                // Read it back through the same reader the bearer resolves
+                // with: the file is only "saved" if that reader sees it.
+                let back = apn_from_source(&path);
+                out.push(format!("saved APN {apn} to {path}"));
+                out.push(format!("saved_apn: {}", or_dash(back.clone())));
+                let ok = back.as_deref() == Some(apn.as_str());
+                if ok {
+                    ctx.event("apn-save", apn.clone());
+                } else {
+                    ctx.note(format!("{path} reads back as {back:?}, not {apn:?}"));
+                }
+                Ok(outcome(out, ok))
             }
             "up" => {
                 let session = ctx.at()?;
@@ -433,7 +728,10 @@ impl Capability for Data {
                 }
                 Ok(Outcome::pass(out))
             }
-            other => bail!("data: unknown action {other:?} (up [apn]|down|status|apn)"),
+            other => bail!(
+                "data: unknown action {other:?} \
+                 (up [apn]|down|status|apn|contexts|set-apn <apn>|clear-apn|save-apn <apn>)"
+            ),
         }
     }
 }
@@ -459,6 +757,77 @@ mod tests {
         assert_eq!(mask_to_prefix(Ipv4Addr::new(255, 255, 255, 0)), 24);
         assert_eq!(mask_to_prefix(Ipv4Addr::new(255, 255, 254, 0)), 23);
         assert_eq!(mask_to_prefix(Ipv4Addr::new(255, 255, 255, 255)), 32);
+    }
+
+    fn reply(lines: &[&str]) -> crate::at::Reply {
+        crate::at::Reply {
+            command: "AT".to_string(),
+            lines: lines.iter().map(|s| s.to_string()).collect(),
+            urcs: Vec::new(),
+            final_code: crate::at::FinalCode::Ok,
+            elapsed: std::time::Duration::from_millis(1),
+            attempts: 1,
+        }
+    }
+
+    #[test]
+    fn cgdcont_lines_are_read_with_their_empty_contexts() {
+        let answer = reply(&[
+            "+CGDCONT: 1,\"IPV4V6\",\"3gnet\",\"0.0.0.0.0.0.0.0\",0,0,0,0",
+            "+CGDCONT: 2,\"IPV4V6\",\"\",\"0.0.0.0.0.0.0.0\",0,0,0,0",
+            "OK",
+        ]);
+        let contexts = parse_cgdcont_all(&answer);
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[0].cid, 1);
+        assert_eq!(contexts[0].pdp_type, "IPV4V6");
+        assert_eq!(contexts[0].apn, "3gnet");
+        // a context that exists and names nothing is still a context
+        assert_eq!(contexts[1].cid, 2);
+        assert_eq!(contexts[1].apn, "");
+    }
+
+    #[test]
+    fn cgact_answers_which_contexts_are_up() {
+        let answer = reply(&["+CGACT: 1,1", "+CGACT: 2,0", "OK"]);
+        assert_eq!(parse_cgact(&answer), vec![(1, 1), (2, 0)]);
+        assert!(parse_cgact(&reply(&["ERROR"])).is_empty());
+    }
+
+    /// The file's comments are where the resolution order is written down, and
+    /// its commented `#APN=` line is the documented "not pinned" state: both
+    /// have to survive a save.
+    #[test]
+    fn saving_an_apn_leaves_the_rest_of_the_file_alone() {
+        let template = "# the override\n#\n#APN=cbnet\nOTHER=1\n";
+        let saved = upsert_apn(template, "cbnet");
+        assert!(saved.contains("# the override\n"), "{saved}");
+        assert!(saved.contains("#APN=cbnet"), "{saved}");
+        assert!(saved.contains("OTHER=1"), "{saved}");
+        assert!(saved.ends_with("APN=cbnet\n"), "{saved}");
+        assert!(!saved.contains("\n\n\n"), "blank lines stay as they were: {saved}");
+
+        // an active line is replaced in place, and a second one is dropped
+        let with_value = "# c\nAPN=3gnet\nAPN=old\nOTHER=1\n";
+        let saved = upsert_apn(with_value, "cmnet");
+        assert_eq!(saved, "# c\nAPN=cmnet\nOTHER=1\n");
+    }
+
+    /// An APN goes into an AT command inside quotes, so a value that carries a
+    /// quote or a comma is refused rather than escaped: it would not be the APN
+    /// anyone meant to type.
+    #[test]
+    fn an_apn_argument_is_checked_before_it_reaches_at() {
+        let ok = "cbnet".to_string();
+        assert_eq!(apn_argument(Some(&ok)).unwrap(), "cbnet");
+        assert!(apn_argument(None).is_err());
+        for bad in ["", " ", "cbn,et", "cb\"net", "cb net", "cb\nnet"] {
+            let bad = bad.to_string();
+            assert!(
+                apn_argument(Some(&bad)).is_err(),
+                "{bad:?} should be refused"
+            );
+        }
     }
 
     #[test]

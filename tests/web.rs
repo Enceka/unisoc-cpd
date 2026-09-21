@@ -60,7 +60,23 @@ fn web_serves_the_page_and_the_daemons_state() {
     std::mem::forget(_modem);
     let dir = scratch("web");
     let profile = dir.join("pty.toml");
-    std::fs::write(&profile, profile_toml(&slave, None, "")).expect("write profile");
+    // The APN panel writes the profile's override file, so the rig has one --
+    // in the shape the shipped one ships in: comments and a commented-out
+    // `#APN=` template line, i.e. not pinned.
+    let apn_conf = dir.join("mobile-data.conf");
+    std::fs::write(&apn_conf, "# override\n#APN=cbnet\n").expect("write apn conf");
+    std::fs::write(
+        &profile,
+        profile_toml(
+            &slave,
+            None,
+            &format!(
+                "\n[data]\nifname = \"test0\"\ncid = 1\napn_source = \"{}\"\n",
+                apn_conf.display()
+            ),
+        ),
+    )
+    .expect("write profile");
     let socket = dir.join("state").join("cmd.sock");
     let runs = dir.join("runs");
     let state = dir.join("state");
@@ -115,6 +131,9 @@ fn web_serves_the_page_and_the_daemons_state() {
     let mut rejected_ok = false;
     let mut imei_guard_ok = false;
     let mut sms_delete_ok = false;
+    let mut apn_ok = false;
+    let mut apn_set_ok = false;
+    let mut apn_save_ok = false;
     let mut cell_lock_ok = false;
     for _ in 0..50 {
         std::thread::sleep(Duration::from_millis(200));
@@ -151,6 +170,35 @@ fn web_serves_the_page_and_the_daemons_state() {
         if !network_ok {
             if let Some(body) = http_try(port, "/api/network") {
                 network_ok |= body.contains("46001") && body.contains("5G SA");
+            }
+        }
+        if !apn_ok {
+            if let Some(body) = http_try(port, "/api/apn") {
+                apn_ok |= body.contains("\"contexts\":[")
+                    && body.contains("\"cid\":1")
+                    && body.contains("mobile-data.conf");
+            }
+        }
+        if !apn_set_ok {
+            // The modem's context is written and read back: the panel must show
+            // what the CP says, not what was sent.
+            if let Some(body) = http_post_try(port, "/api/apn-set", "apn=cmnet&cid=1") {
+                apn_set_ok |= body.contains("\"status\":\"pass\"");
+            }
+            if apn_set_ok {
+                if let Some(body) = http_try(port, "/api/apn") {
+                    apn_set_ok &= body.contains("\"apn\":\"cmnet\"");
+                }
+            }
+        }
+        if !apn_save_ok {
+            if let Some(body) = http_post_try(port, "/api/apn-save", "apn=cbnet") {
+                apn_save_ok |= body.contains("\"status\":\"pass\"");
+            }
+            if apn_save_ok {
+                if let Some(body) = http_try(port, "/api/apn") {
+                    apn_save_ok &= body.contains("\"saved_apn\":\"cbnet\"");
+                }
             }
         }
         if !metrics_ok {
@@ -243,6 +291,9 @@ fn web_serves_the_page_and_the_daemons_state() {
             && rejected_ok
             && imei_guard_ok
             && sms_delete_ok
+            && apn_ok
+            && apn_set_ok
+            && apn_save_ok
         {
             break;
         }
@@ -267,4 +318,10 @@ fn web_serves_the_page_and_the_daemons_state() {
         "an identity write did not pass the page's guard into the capability's own"
     );
     assert!(sms_delete_ok, "a SMS delete did not reach the daemon as an index");
+    assert!(apn_ok, "/api/apn did not report the contexts and the override file");
+    assert!(
+        apn_set_ok,
+        "a written APN was not read back out of the modem's context"
+    );
+    assert!(apn_save_ok, "an APN was not saved to the override file");
 }
