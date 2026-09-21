@@ -296,8 +296,22 @@ _2026-09-21, the fast takeover of §13, handset on the 广电 (46015) network._
   a caller that waits for `CONNECT` will read a successful answer as a
   failure.)
 
-**Still open for A9:** in-call audio (the profile still says
-`voice.supported = false`; nobody has measured whether the CP's default
-route carries audio on this bench), MO dial, DTMF, and the five-minute
-two-way run.
+**Still open for A9:** in-call audio and the five-minute two-way run.
+MO dial and the audio verdict are now measured (same session, the web
+face's first hours): an MO VoLTE dial **connected** — the signaling half
+of G4 works in both directions — and the far end heard **silence**, which
+settles the open question: the profile's `voice.supported = false` is
+truthful, not conservative.  The CP negotiates the call end to end; what
+nobody routes is the handset's own codec into the CP (that wiring belongs
+to the vendor audio stack we deliberately replaced), so W4's audio work is
+a mixer/route problem (tinyalsa-class), not a signaling one.
+
+The SMS surface needed re-learning this session: the RIL had parked the
+teach-in charset at `HEX` again (the SMSC read back as hex-of-ASCII,
+`+CSCS="GSM"` first, then re-arm — `<smsc>` here), and a cold
+cycle wipes the `+CNMI` MT indication armed at start (measured:
+`0,0,0,1,0` after `cfun cold`), so serve now re-arms the surface after
+every passing cfun.  With both fixed, an MO loopback submit delivered and
+was captured by the `+CMTI` path into the daemon's inbox, end to end
+under the daemon.
 
