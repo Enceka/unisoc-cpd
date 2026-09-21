@@ -402,3 +402,35 @@ _2026-09-21, Android side, the vendor RIL stopped for each window._
   `vendor.ril-daemon` recovers slot 1 within ~25 s; a reboot is the clean way
   back.
 
+
+---
+
+## 15. The daemon replaces the RIL's data face, and the phone keeps its internet
+
+_2026-09-21, third boot of the day, the web face running on the handset._
+
+With the vendor stack dead, the data path needed three things the RIL
+normally does, in this order:
+
+1. **`AT+CGATT=1` -- the attach nobody performs.**  After a cold cycle the
+   CP registers (CEREG 2,1, C5GREG 0,1) but sits at `+CGATT: 0` forever:
+   attach is a RIL decision, not a CP reflex.  A manual attach answered
+   `+CME ERROR: 0` once while registration was still settling -- the same
+   command succeeded minutes later.  (A light `AT+CFUN=0`/`AT+CFUN=1`
+   cycle also recovered a boot where the full cold cycle left CEREG at
+   2,0 -- the third boot of the day did not survive cold cycle #1.)
+2. **`data up cbnet`** -- APN pinned by argument (the `/etc/e5` override
+   file does not exist on Android, and the MCC-MNC table read came too
+   early after the cold).  The action then drove CGDCONT/CGACT/
+   `+CGDATA="M-ETHER"` and the CP handed the AP a real bearer: the kernel
+   instantiated **`sipa_eth0`** with `10.33.251.55/8` from `+CGCONTRDP`.
+3. **The NAT plan** -- `ip_forward`, default route in `legacy_system`
+   (the policy-routing trap from FINDINGS 25.8), the
+   `tetherctrl_FORWARD` ACCEPT pair, and `-o sipa_eth0 -j MASQUERADE`.
+
+End state, measured on the handset: the host pings by name through the
+bearer (`www.gov.cn`, 2/2, ~42 ms), the identity panel reports
+`ip 10.33.251.55 / apn cbnet`, and a hotspot client would walk the same
+masquerade.  The one honest gap: the CP does not answer the `SPENGMD`
+measurement queries, so the web's serving-cell metrics report
+`serving_supported: false` -- probe, report, do not pretend (W5).
