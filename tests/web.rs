@@ -113,6 +113,7 @@ fn web_serves_the_page_and_the_daemons_state() {
     let mut bands_ok = false;
     let mut band_lock_ok = false;
     let mut rejected_ok = false;
+    let mut imei_guard_ok = false;
     let mut cell_lock_ok = false;
     for _ in 0..50 {
         std::thread::sleep(Duration::from_millis(200));
@@ -188,6 +189,29 @@ fn web_serves_the_page_and_the_daemons_state() {
                 }
             }
         }
+        if !imei_guard_ok {
+            // The rig's profile declares no write contract, so a correctly
+            // confirmed write must get *past* the page's guard and be refused
+            // by the capability's own guards -- which is what proves the page
+            // is not the only thing standing between a browser and the NV.
+            let imei = "490154203237518";
+            if let Some(body) = http_post_try(
+                port,
+                "/api/imei-write",
+                &format!("imei={imei}&confirm={imei}&acknowledged=yes&index=0"),
+            ) {
+                imei_guard_ok |= body.contains("[nv].readonly")
+                    || body.contains("write_command")
+                    || body.contains("imei_items");
+            }
+            if let Some(body) = http_post_try(
+                port,
+                "/api/imei-write",
+                &format!("imei={imei}&confirm=490154203237519&acknowledged=yes"),
+            ) {
+                imei_guard_ok &= body.contains("does not match");
+            }
+        }
         if !rejected_ok {
             // A typo must fail the request, not lock the bands that parsed.
             if let Some(body) = http_post_try(port, "/api/band-lock", "rat=nr&bands=n78") {
@@ -206,6 +230,7 @@ fn web_serves_the_page_and_the_daemons_state() {
             && band_lock_ok
             && cell_lock_ok
             && rejected_ok
+            && imei_guard_ok
         {
             break;
         }
@@ -225,4 +250,8 @@ fn web_serves_the_page_and_the_daemons_state() {
     assert!(band_lock_ok, "a band lock was not read back through /api/bands");
     assert!(cell_lock_ok, "a cell lock was not read back through /api/bands");
     assert!(rejected_ok, "a bad band token was not rejected");
+    assert!(
+        imei_guard_ok,
+        "an identity write did not pass the page's guard into the capability's own"
+    );
 }

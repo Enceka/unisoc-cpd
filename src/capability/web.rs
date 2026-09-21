@@ -158,6 +158,13 @@ fn route(stream: &mut TcpStream, method: &str, path: &str, body: &str, socket: &
             let rat = if rat.is_empty() { "all".to_string() } else { rat };
             respond_json(stream, &run_cap(socket, "band", &["cell-unlock", rat.as_str()]));
         }
+        ("POST", "/api/imei-write") => match imei_write_args(body) {
+            Ok(args) => {
+                let borrowed: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                respond_json(stream, &run_cap(socket, "imei", &borrowed));
+            }
+            Err(e) => respond_json(stream, &json!({ "ok": false, "status": "error", "error": e })),
+        },
         ("POST", "/api/at") => {
             // The console is a thin front-end over the daemon's own `at`
             // capability: the command is parsed and sent by the process that
@@ -400,6 +407,50 @@ fn cell_request(body: &str) -> Result<(String, u32, u32), String> {
             .map_err(|_| format!("{key} must be a number, got {raw:?}"))
     };
     Ok((rat, number("freq")?, number("pci")?))
+}
+
+/// The capability arguments for an identity write, or why nothing was sent.
+///
+/// This is the page's half of a two-part guard.  The capability has its own
+/// (`--yes`, the profile's `[nv].readonly`, a pinned write template, a fresh
+/// NV backup and an independent read-back); what a browser adds is the part a
+/// capability cannot: a second, deliberate entry of the value, and an
+/// acknowledgement that the operator read what it costs.
+///
+/// The confirmation is the *value itself*, not a boolean.  A mistyped digit
+/// has to fail here, in front of the person who typed it, rather than at the
+/// modem.
+fn imei_write_args(body: &str) -> Result<Vec<String>, String> {
+    let imei = form_value(body, "imei").unwrap_or_default().trim().to_string();
+    if imei.is_empty() {
+        return Err("no IMEI given".to_string());
+    }
+    let confirm = form_value(body, "confirm").unwrap_or_default().trim().to_string();
+    if confirm != imei {
+        return Err("the confirmation does not match the IMEI; nothing was sent".to_string());
+    }
+    if form_value(body, "acknowledged").as_deref() != Some("yes") {
+        return Err("the identity warning was not acknowledged; nothing was sent".to_string());
+    }
+    let index = form_value(body, "index").unwrap_or_default().trim().to_string();
+    let index = if index.is_empty() { "0".to_string() } else { index };
+    if index.parse::<u32>().map(|i| i > 2).unwrap_or(true) {
+        return Err("index must be 0, 1 or 2 (SIM 1, SIM 2, spare)".to_string());
+    }
+
+    // `--yes` is passed on, never assumed: it is the capability's own gate and
+    // the run summary records it.
+    let mut args = vec![
+        "write".to_string(),
+        imei,
+        "--index".to_string(),
+        index,
+        "--yes".to_string(),
+    ];
+    if form_value(body, "allow_bad_checksum").as_deref() == Some("yes") {
+        args.push("--allow-bad-checksum".to_string());
+    }
+    Ok(args)
 }
 
 fn api_metrics(socket: &Path) -> Value {
@@ -726,6 +777,22 @@ EARFCN <input id="cell-freq" size="9" autocomplete="off"> PCI <input id="cell-pc
 <button onclick="cellLock()">锁定</button><button class="red" onclick="cellUnlock()">解锁</button></div>
 <pre id="cells-out">…</pre></details>
 
+<details id="d-imei"><summary>IMEI（读 · 写入[危险 · 二次确认]）</summary>
+<button onclick="loadIdentity()">刷新</button>
+<div class="kv" id="imei-read">展开后读取…</div>
+<div class="warn">⚠️ 写 IMEI 是永久改变这台设备身份的操作，且不可从这里撤销。只对你自己拥有的硬件做：
+恢复被刷坏的出厂值，或给实验机编一个。把设备伪装成另一台在很多司法辖区是犯罪，运营商也会按 IMEI 拉黑。
+守护进程那一侧还压着三道闸：profile 的 <code>[nv].readonly</code>、必须已固定的
+<code>[imei].write_command</code> 模板、写前强制 NV 备份以及写后 diag 独立读回；任何一道不过就是 fail。</div>
+<div>索引 <select id="imei-index"><option value="0">0 · SIM 1</option>
+<option value="1">1 · SIM 2</option><option value="2">2 · spare</option></select>
+新 IMEI（15 位数字）<input id="imei-value" size="18" autocomplete="off"></div>
+<div>再输入一次（确认）<input id="imei-confirm" size="18" autocomplete="off"></div>
+<div><label><input type="checkbox" id="imei-ack"> 我确认这是我拥有的设备，并已读完上面的警告</label></div>
+<div><label><input type="checkbox" id="imei-bad"> 允许校验位不通过（只给实验用的假值）</label></div>
+<button class="red" onclick="imeiWrite()">写入 IMEI</button>
+<pre id="imei-out">…</pre></details>
+
 <h2>短信 · inbox</h2><div id="msgs">…</div>
 <h2>发短信</h2>
 <div><input id="to" placeholder="+86…" size="14"> <input id="text" placeholder="内容" size="24">
@@ -842,7 +909,28 @@ async function loadIdentity(){
     h += kv('IP', d.ip); h += kv('APN', d.apn); h += kv('DNS', d.dns); h += kv('SMSC', d.smsc);
     (d.errors||[]).forEach(function(x){ h += '<div class="err">'+esc(x)+'</div>'; });
     el.innerHTML = h;
+    const ie = document.getElementById('imei-read');
+    if(ie) ie.innerHTML = (d.imei||[]).map(function(e){
+      return kv('IMEI' + e.index + ' (' + (e.slot||'') + ')',
+                e.value ? e.value : (e.detail||'读取失败')); }).join('')
+      || '<div class="err">没有读到 IMEI（profile 未列 [nv].imei_items，或 diag 节点未起来）</div>';
   }catch(e){ el.textContent = '读取失败: '+e; } }
+async function imeiWrite(){
+  const v = document.getElementById('imei-value').value.trim();
+  const c = document.getElementById('imei-confirm').value.trim();
+  if(!v || v !== c){
+    out('imei-out', {error:'两次输入不一致（或为空），没有发送任何东西'}); return; }
+  if(!document.getElementById('imei-ack').checked){
+    out('imei-out', {error:'请先勾选“我确认这是我拥有的设备”'}); return; }
+  const idx = document.getElementById('imei-index').value;
+  // The last act: a dialog that names the value and the slot, so the click
+  // that writes is never the same click that filled the form in.
+  if(!window.confirm('确认把 IMEI 索引 '+idx+' 写成 '+v+' ？\n这是永久改动，守护进程会先备份 NV 再写入并独立读回验证。')){
+    return; }
+  out('imei-out', await post('/api/imei-write', {
+    imei:v, confirm:c, index:idx, acknowledged:'yes',
+    allow_bad_checksum: document.getElementById('imei-bad').checked ? 'yes' : 'no' }));
+  loadIdentity(); }
 async function loadMetrics(){
   const el = document.getElementById('metrics');
   el.textContent = '读取中…（要探测测量类 AT，可能几十秒）';
@@ -948,6 +1036,7 @@ function lazyLoad(){
   document.getElementById('d-network').addEventListener('toggle', function(){ if(this.open) loadNetwork(); });
   document.getElementById('d-bands').addEventListener('toggle', function(){ if(this.open) loadLocks(); });
   document.getElementById('d-cells').addEventListener('toggle', function(){ if(this.open) loadLocks(); });
+  document.getElementById('d-imei').addEventListener('toggle', function(){ if(this.open) loadIdentity(); });
 }
 
 var atHist = [];
@@ -1147,6 +1236,44 @@ mod tests {
         assert_eq!(state["lte_cells"][1]["pci"], 7);
         assert_eq!(state["nr_cells"], json!([]));
         assert_eq!(state["sprat"], "LTE 32");
+    }
+
+    /// The page's half of the identity guard: the confirmation is the value
+    /// itself, and the acknowledgement is explicit.  A request that fails
+    /// either never reaches the modem.
+    #[test]
+    fn an_identity_write_takes_two_entries_and_an_acknowledgement() {
+        // A Luhn-valid placeholder, of the kind the rig and the docs use.
+        let imei = "490154203237518";
+        let args = imei_write_args(&format!(
+            "imei={imei}&confirm={imei}&acknowledged=yes&index=1"
+        ))
+        .unwrap();
+        assert_eq!(
+            args,
+            vec!["write", "490154203237518", "--index", "1", "--yes"]
+        );
+        // the confirmation must be the value, not a boolean
+        assert!(imei_write_args(&format!("imei={imei}&confirm=yes&acknowledged=yes")).is_err());
+        // a mistyped digit fails in front of the person who typed it
+        assert!(imei_write_args(&format!(
+            "imei={imei}&confirm=490154203237519&acknowledged=yes"
+        ))
+        .is_err());
+        assert!(
+            imei_write_args(&format!("imei={imei}&confirm={imei}")).is_err(),
+            "no acknowledgement"
+        );
+        assert!(imei_write_args(&format!(
+            "imei={imei}&confirm={imei}&acknowledged=yes&index=7"
+        ))
+        .is_err());
+        assert!(imei_write_args("").is_err());
+        let overridden = imei_write_args(&format!(
+            "imei={imei}&confirm={imei}&acknowledged=yes&allow_bad_checksum=yes"
+        ))
+        .unwrap();
+        assert!(overridden.contains(&"--allow-bad-checksum".to_string()));
     }
 
     #[test]
