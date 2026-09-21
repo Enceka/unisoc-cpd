@@ -121,6 +121,21 @@ fn route(stream: &mut TcpStream, method: &str, path: &str, body: &str, socket: &
             });
             respond_json(stream, &answer);
         }
+        ("POST", "/api/at") => {
+            // The console is a thin front-end over the daemon's own `at`
+            // capability: the command is parsed and sent by the process that
+            // owns the channel, so the one-reader rule is not weakened by a
+            // browser being able to type.  Nothing is sanitised beyond an
+            // empty check -- the whole point is a raw console -- but what it
+            // can reach is exactly what `unisoc-cpd at` can reach.
+            let cmd = form_value(body, "cmd").unwrap_or_default();
+            let cmd = cmd.trim().to_string();
+            if cmd.is_empty() {
+                respond_json(stream, &json!({ "ok": false, "status": "error", "error": "empty AT command" }));
+            } else {
+                respond_json(stream, &run_cap(socket, "at", &[cmd.as_str()]));
+            }
+        }
         ("POST", "/api/send") => {
             let to = form_value(body, "to").unwrap_or_default();
             let text = form_value(body, "text").unwrap_or_default();
@@ -210,6 +225,12 @@ const PAGE: &str = r#"<!doctype html>
  #banner button{font-size:22px;margin:12px}
  .msg{border-bottom:1px solid #2a2a2a;padding:6px 2px;font-size:13px}
  .from{color:#8bc78b}
+ .warn{background:#3a2a12;border:1px solid #8a6420;color:#f0d9a8;border-radius:6px;padding:8px;font-size:12px;margin:6px 0}
+ details{border:1px solid #333;border-radius:6px;margin:8px 0;padding:6px 8px;background:#161616}
+ summary{cursor:pointer;font-weight:600;font-size:14px}
+ .kv{font-size:13px;line-height:1.7} .kv b{color:#9cc79c;font-weight:600;display:inline-block;min-width:74px}
+ .hist{font-size:12px;color:#888;cursor:pointer}
+ .hist:hover{color:#ddd}
 </style></head><body>
 <h1>unisoc-cpd</h1>
 <div class="chips" id="radio">…</div>
@@ -227,6 +248,17 @@ const PAGE: &str = r#"<!doctype html>
 <button onclick="dial()">呼叫</button>
 <button onclick="act('answer')">接听</button>
 <button class="red" onclick="act('hangup')">挂断</button></div><pre id="call-out"></pre>
+
+<h2>自定义 AT 控制台</h2>
+<div class="warn">⚠️ 这是直通 CP 的原始 AT 通道。查询类（<code>AT+CSQ</code>、<code>AT+CEREG?</code>）是安全的；
+但写类命令（<code>AT+SPLBAND=1,…</code>、<code>AT+SPFORCEFRQ=…</code>、<code>AT+SPIMEI=…</code>、任何厂商
+NV 命令）会立刻并可能永久改变基带配置 / NV，写错可能失联直到恢复出厂。
+命令由持有唯一 AT 通道的守护进程执行，本页只做转发。</div>
+<div><input id="at-cmd" placeholder="AT+CSQ" size="34" autocomplete="off">
+<button onclick="sendAt()">发送</button>
+<button class="red" onclick="clearAtHist()">清空历史</button></div>
+<pre id="at-out">…</pre>
+<div id="at-hist"></div>
 
 <h2>事件流（urc）</h2><pre id="urc-out">…</pre>
 <h2>状态详情</h2><pre id="stat-out">…</pre>
@@ -304,6 +336,30 @@ async function dial(){ const r = await post('/api/dial', {number:document.getEle
  out('call-out', r); }
 async function act(w){ const r = await post('/api/'+w, {}); out('call-out', r);
  if(w!=='hangup') setTimeout(function(){document.getElementById('banner').style.display='none';}, 800); }
+
+var atHist = [];
+try { atHist = JSON.parse(localStorage.getItem('atHist') || '[]') || []; } catch(e) { atHist = []; }
+function renderAtHist(){
+  document.getElementById('at-hist').innerHTML = atHist.length
+    ? atHist.map(function(c){
+        var esc = c.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+        return '<span class="hist" onclick="useAt(this)" data-cmd="'+esc+'">'+esc+'</span>';
+      }).join(' · ')
+    : '<span class="hist">（无历史）</span>';
+}
+function useAt(el){ document.getElementById('at-cmd').value = el.getAttribute('data-cmd'); }
+function clearAtHist(){ atHist = []; localStorage.setItem('atHist','[]'); renderAtHist(); }
+async function sendAt(){
+  var cmd = document.getElementById('at-cmd').value.trim();
+  if(!cmd) return;
+  atHist = [cmd].concat(atHist.filter(function(c){ return c!==cmd; })).slice(0,12);
+  localStorage.setItem('atHist', JSON.stringify(atHist)); renderAtHist();
+  var r = await post('/api/at', {cmd: cmd});
+  out('at-out', r);
+}
+function atEnter(e){ if(e.key==='Enter') sendAt(); }
+document.getElementById('at-cmd').addEventListener('keydown', atEnter);
+renderAtHist();
 setInterval(refreshState, 5000); setInterval(refreshUrc, 2000); setInterval(refreshMsgs, 8000);
 setInterval(refreshStatus, 20000);
 refreshState(); refreshUrc(); refreshMsgs(); refreshStatus();

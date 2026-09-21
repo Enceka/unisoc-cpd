@@ -36,6 +36,22 @@ fn wait_for_daemon(socket: &Path) -> bool {
     false
 }
 
+fn http_post_try(port: u16, path: &str, body: &str) -> Option<String> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(20))).ok()?;
+    write!(
+        s,
+        "POST {path} HTTP/1.1\r\nHost: bench\r\nContent-Type: application/x-www-form-urlencoded\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .ok()?;
+    let mut out = String::new();
+    s.read_to_string(&mut out).ok()?;
+    Some(out)
+}
+
 #[test]
 fn web_serves_the_page_and_the_daemons_state() {
     let (master, slave) = pty_pair();
@@ -89,6 +105,7 @@ fn web_serves_the_page_and_the_daemons_state() {
     let mut page_ok = false;
     let mut state_ok = false;
     let mut dial_ok = false;
+    let mut at_ok = false;
     for _ in 0..50 {
         std::thread::sleep(Duration::from_millis(200));
         if let Some(body) = http_try(port, "/") {
@@ -100,7 +117,14 @@ fn web_serves_the_page_and_the_daemons_state() {
         if let Some(body) = http_try(port, "/api/urc") {
             dial_ok |= body.contains("urc");
         }
-        if page_ok && state_ok && dial_ok {
+        if !at_ok {
+            // The AT console is a front-end over the daemon's own `at`
+            // capability, so the fake CP's answer is what must come back.
+            if let Some(body) = http_post_try(port, "/api/at", "cmd=AT%2BCSQ") {
+                at_ok |= body.contains("+CSQ: 23,99");
+            }
+        }
+        if page_ok && state_ok && dial_ok && at_ok {
             break;
         }
     }
@@ -110,4 +134,5 @@ fn web_serves_the_page_and_the_daemons_state() {
     assert!(page_ok, "the page did not load; web.log: {web_out}");
     assert!(state_ok, "/api/state did not answer");
     assert!(dial_ok, "/api/urc did not answer");
+    assert!(at_ok, "/api/at did not run AT+CSQ through the daemon");
 }
