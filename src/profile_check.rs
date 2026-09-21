@@ -72,6 +72,22 @@ fn tokens_of(p: &Profile) -> Vec<String> {
             add(&mut tokens, literal);
         }
     }
+    // The NAT names are as platform-specific as the interface is: a routing
+    // table, a firewall chain and the LAN interfaces are things only the
+    // profile is allowed to know, since `src/nat.rs` builds commands out of
+    // them without ever naming one.
+    for value in [
+        p.data.nat.forward_chain.as_deref(),
+        p.data.nat.route_table.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        add(&mut tokens, value);
+    }
+    for client in &p.data.nat.clients {
+        add(&mut tokens, client);
+    }
     tokens.into_iter().collect()
 }
 

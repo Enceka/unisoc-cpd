@@ -325,6 +325,325 @@ pub fn resolve_apn(
 }
 
 /// Pass or fail, from the lines and the verdict.
+// ------------------------------------------------------------- the host side
+
+/// `data nat` — the routing, forwarding and masquerading that make a bearer the
+/// platform did not bring up usable by the host and by everything behind it.
+///
+/// None of this parses AT, and none of it is platform-shaped: the table, the
+/// chain and the clients come from the profile, and the commands themselves are
+/// built in `src/nat.rs`, which is where they are tested.  This half runs them
+/// and says what happened.
+fn nat_action(ctx: &mut Context, what: &str) -> Result<Outcome> {
+    match what {
+        // Print what `on` would run, and change nothing.  A firewall is a bad
+        // place to find out what a command does.
+        "plan" => {
+            let (plan, mut out) = nat_facts(&ctx.profile);
+            for step in crate::nat::install(&plan) {
+                out.push(step.describe());
+            }
+            Ok(Outcome::pass(out))
+        }
+        "status" => Ok(nat_report(ctx)),
+        "on" => {
+            if !ctx.profile.data.nat.enabled {
+                bail!(
+                    "profile {:?} has [data.nat].enabled = false, so there is nothing to \
+                     install; that decision belongs in the profile",
+                    ctx.profile.name
+                );
+            }
+            let (plan, mut out) = nat_facts(&ctx.profile);
+            let (applied, ok) = nat_apply(&plan, true);
+            out.extend(applied);
+            if ok {
+                ctx.note(
+                    "host and clients now have a way out; name resolution on the host itself \
+                     is the platform resolver's business and is reported, not changed"
+                        .to_string(),
+                );
+            }
+            Ok(outcome(out, ok))
+        }
+        "off" => {
+            let (plan, mut out) = nat_facts(&ctx.profile);
+            let (applied, ok) = nat_apply(&plan, false);
+            out.extend(applied);
+            if !ok {
+                ctx.note("some host-side rules were not there to remove".to_string());
+            }
+            Ok(outcome(out, ok))
+        }
+        other => bail!("data nat: unknown action {other:?} (on | off | status | plan)"),
+    }
+}
+
+/// Install the host side as part of bringing the bearer up.
+fn nat_install(profile: &crate::profile::Profile) -> (Vec<String>, bool) {
+    let (plan, mut out) = nat_facts(profile);
+    let (applied, ok) = nat_apply(&plan, true);
+    out.extend(applied);
+    (out, ok)
+}
+
+/// The reverse, as part of tearing the bearer down.
+fn nat_remove(profile: &crate::profile::Profile) -> (Vec<String>, bool) {
+    let (plan, mut out) = nat_facts(profile);
+    let (applied, ok) = nat_apply(&plan, false);
+    out.extend(applied);
+    (out, ok)
+}
+
+/// Run every step of a plan.  Returns the lines to show and whether all of them
+/// took; the failure text is kept, because "Permission denied" and "Chain
+/// already exists" are different problems with different answers.
+fn nat_apply(plan: &crate::nat::Plan, install: bool) -> (Vec<String>, bool) {
+    let steps = if install {
+        crate::nat::install(plan)
+    } else {
+        crate::nat::remove(plan)
+    };
+    let mut out = Vec::new();
+    let mut failed = 0usize;
+    for step in &steps {
+        let (took, text) = run_step(step);
+        if took {
+            out.push(format!("ok   {}", step.line()));
+        } else {
+            failed += 1;
+            out.push(format!("FAIL {}", step.line()));
+            if !text.is_empty() {
+                out.push(format!("     {text}"));
+            }
+        }
+    }
+    out.push(format!(
+        "nat: {} of {} step(s) {}",
+        steps.len() - failed,
+        steps.len(),
+        if install { "installed" } else { "removed" }
+    ));
+    (out, failed == 0)
+}
+
+/// Run one step.  An `Ensure` asks its check question first: `iptables` has no
+/// replace form, so `-C` is how a second install stays a no-op instead of a
+/// duplicate rule.
+fn run_step(step: &crate::nat::Step) -> (bool, String) {
+    match step {
+        crate::nat::Step::Once(argv) => run_argv(argv),
+        crate::nat::Step::Ensure { check, add } => {
+            let (present, _) = run_argv(check);
+            if present {
+                (true, String::new())
+            } else {
+                run_argv(add)
+            }
+        }
+    }
+}
+
+/// Run an argv, keeping stderr.  `run` above drops it, which is right for the
+/// `ip` calls the bearer path makes and wrong here: a rule that will not go in
+/// usually explains itself, and that explanation is the whole report.
+fn run_argv(argv: &[String]) -> (bool, String) {
+    let Some((program, rest)) = argv.split_first() else {
+        return (false, "empty command".to_string());
+    };
+    let args: Vec<&str> = rest.iter().map(|s| s.as_str()).collect();
+    match Command::new(program).args(&args).output() {
+        Ok(o) => {
+            let mut text = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            if !err.is_empty() {
+                if !text.is_empty() {
+                    text.push_str(" | ");
+                }
+                text.push_str(&err);
+            }
+            (o.status.success(), text)
+        }
+        Err(e) => (false, format!("{e}")),
+    }
+}
+
+/// The facts the plan is built from, read off the host, and the lines that
+/// report them.
+///
+/// A client interface whose IPv4 address cannot be read is named and left out
+/// rather than guessed at: a route for a subnet nobody measured is worse than
+/// no route at all, because it looks installed.
+fn nat_facts(profile: &crate::profile::Profile) -> (crate::nat::Plan, Vec<String>) {
+    let bearer = profile.data.interface(None).unwrap_or_default();
+    let mut out = Vec::new();
+    let bearer_subnet = interface_network(&bearer);
+    out.push(format!(
+        "bearer: {bearer}{}",
+        bearer_subnet
+            .as_ref()
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_else(|| " (no IPv4 address)".to_string())
+    ));
+
+    let mut clients = Vec::new();
+    for name in &profile.data.nat.clients {
+        match interface_network(name) {
+            Some(subnet) => {
+                out.push(format!("client {name}: {subnet}"));
+                clients.push(crate::nat::Client {
+                    ifname: name.clone(),
+                    subnet,
+                });
+            }
+            None => out.push(format!("client {name}: no IPv4 address, left out of the plan")),
+        }
+    }
+
+    let plan = crate::nat::Plan {
+        bearer,
+        bearer_subnet,
+        route_table: profile.data.nat.route_table.clone(),
+        forward_chain: profile.data.nat.forward_chain.clone(),
+        clients,
+        metric: profile.data.nat.metric,
+    };
+    (plan, out)
+}
+
+/// The on-link network of an interface, from the address `ip` reports for it.
+fn interface_network(ifname: &str) -> Option<String> {
+    if ifname.is_empty() {
+        return None;
+    }
+    let (_, text) = run("ip", &["addr", "show", "dev", ifname]);
+    let (addr, prefix) = crate::nat::parse_addr(&text)?;
+    Some(crate::nat::network(addr, prefix))
+}
+
+/// What the host side looks like right now.  Every probe in here is read-only,
+/// which makes this the safe thing to run first and the safe thing to run
+/// after.
+fn nat_report(ctx: &mut Context) -> Outcome {
+    if !ctx.profile.data.nat.enabled {
+        return Outcome::pass(vec![format!(
+            "nat: not enabled in profile {:?}, so `data up` installs nothing",
+            ctx.profile.name
+        )]);
+    }
+    let (plan, mut out) = nat_facts(&ctx.profile);
+    let mut missing: Vec<String> = Vec::new();
+
+    let (_, forward) = run("sysctl", &["-n", "net.ipv4.ip_forward"]);
+    let forwarding = forward.trim() == "1";
+    out.push(format!("ip_forward: {}", if forwarding { "1" } else { "0" }));
+    if !forwarding {
+        missing.push("net.ipv4.ip_forward is 0".to_string());
+    }
+
+    let (_, main) = run("ip", &["route", "show"]);
+    let main_dev = crate::nat::default_dev(&main);
+    out.push(format!(
+        "route_default_main: {}",
+        main_dev.as_deref().unwrap_or("-")
+    ));
+
+    if let Some(table) = &plan.route_table {
+        // A table no rule reaches is the failure this reader exists to catch:
+        // its routes read as installed while carrying nothing.
+        let (_, rules) = run("ip", &["rule", "show"]);
+        let priorities = crate::nat::table_priorities(&rules, table);
+        out.push(format!(
+            "rule_table_{table}: {}",
+            if priorities.is_empty() {
+                "no rule reaches it".to_string()
+            } else {
+                priorities
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        ));
+        if priorities.is_empty() {
+            missing.push(format!("no `ip rule` reaches table {table}"));
+        }
+
+        let (_, routes) = run("ip", &["route", "show", "table", table.as_str()]);
+        let table_dev = crate::nat::default_dev(&routes);
+        out.push(format!(
+            "route_default_{table}: {}",
+            table_dev.as_deref().unwrap_or("-")
+        ));
+        if table_dev.as_deref() != Some(plan.bearer.as_str()) {
+            missing.push(format!(
+                "no default route through {} in table {table}",
+                plan.bearer
+            ));
+        }
+        for client in &plan.clients {
+            let present = routes
+                .lines()
+                .any(|l| l.trim_start().starts_with(&client.subnet));
+            out.push(format!(
+                "route_client {}: {} {}",
+                client.ifname,
+                client.subnet,
+                if present { "present" } else { "missing" }
+            ));
+            if !present {
+                missing.push(format!("table {table} has no route to {}", client.subnet));
+            }
+        }
+    } else if main_dev.as_deref() != Some(plan.bearer.as_str()) {
+        missing.push(format!("no default route through {}", plan.bearer));
+    }
+
+    let (_, nat_rules) = run("iptables", &["-t", "nat", "-S", "POSTROUTING"]);
+    let masqueraded = crate::nat::masqueraded(&nat_rules, &plan.bearer);
+    out.push(format!(
+        "masquerade {}: {}",
+        plan.bearer,
+        if masqueraded { "present" } else { "missing" }
+    ));
+    if !masqueraded {
+        missing.push(format!("{} is not masqueraded", plan.bearer));
+    }
+
+    if let Some(chain) = &plan.forward_chain {
+        let (exists, rules) = run("iptables", &["-S", chain.as_str()]);
+        if !exists {
+            // A chain the profile names but this host does not have is a fact
+            // about the host rather than a fault in the plan: it is reported as
+            // absent, and no pairs are expected from it.
+            out.push(format!("forward_chain {chain}: absent on this host"));
+        } else {
+            for client in &plan.clients {
+                let leaving = crate::nat::accepted(&rules, &client.ifname, &plan.bearer);
+                let back = crate::nat::accepted(&rules, &plan.bearer, &client.ifname);
+                out.push(format!(
+                    "forward_pair {}: {} / {}",
+                    client.ifname,
+                    if leaving { "out ok" } else { "out missing" },
+                    if back { "back ok" } else { "back missing" }
+                ));
+                if !leaving || !back {
+                    missing.push(format!("{chain} has no ACCEPT pair for {}", client.ifname));
+                }
+            }
+        }
+    }
+
+    if missing.is_empty() {
+        out.push("nat: complete".to_string());
+        Outcome::pass(out)
+    } else {
+        out.push(format!("nat: {} piece(s) missing", missing.len()));
+        ctx.note(format!("host side: {}", missing.join("; ")));
+        Outcome::fail(out)
+    }
+}
+
 fn outcome(lines: Vec<String>, ok: bool) -> Outcome {
     if ok {
         Outcome::pass(lines)
@@ -385,7 +704,7 @@ impl Capability for Data {
 
     fn summary(&self) -> &'static str {
         "PDP context and bearer: up [apn] | down | status | apn | contexts | \
-         set-apn <apn> | clear-apn | save-apn <apn>"
+         set-apn <apn> | clear-apn | save-apn <apn> | nat on|off|status|plan"
     }
 
     fn run(&self, ctx: &mut Context, args: &[String]) -> Result<Outcome> {
@@ -395,6 +714,13 @@ impl Capability for Data {
         let iface = ctx.profile.data.interface(None);
 
         match action {
+            // The host side of the bearer, which is a different question from
+            // whether the PDP context is up: the context can be perfect while
+            // nothing behind the interface can get out (see `src/nat.rs`).
+            "nat" => {
+                let what = pos.get(1).map(|s| s.as_str()).unwrap_or("status");
+                return nat_action(ctx, what);
+            }
             "status" => {
                 let session = ctx.at()?;
                 let mut out = Vec::new();
@@ -707,6 +1033,23 @@ impl Capability for Data {
                         "data",
                         format!("bearer up on {}", iface.clone().unwrap_or_default()),
                     );
+                    // The bearer is up; whether anything can *use* it is a
+                    // separate question, and on a platform that routes by
+                    // policy it is not automatic (see `src/nat.rs`).  When the
+                    // profile asks for the host side, a failure here fails the
+                    // action: a bearer nobody can reach is not a working bearer.
+                    if ctx.profile.data.nat.enabled {
+                        let (lines, routed) = nat_install(&ctx.profile);
+                        out.extend(lines);
+                        ok &= routed;
+                        if !routed {
+                            ctx.note(
+                                "the bearer is up but the host side did not take: nothing \
+                                 behind this interface has a way out"
+                                    .to_string(),
+                            );
+                        }
+                    }
                 }
                 Ok(if ok {
                     Outcome::pass(out)
@@ -720,6 +1063,14 @@ impl Capability for Data {
                 let cmd = format!("AT+CGACT=0,{cid}");
                 let r = session.command(&cmd, Duration::from_secs(10), &[], 0);
                 emit(&mut out, &cmd, &r);
+                if ctx.profile.data.nat.enabled {
+                    // The host-side rules name the bearer, so they go first:
+                    // a forward pair for an interface that is about to leave is
+                    // a rule that silently stops matching, which is harder to
+                    // notice than no rule at all.
+                    let (lines, _) = nat_remove(&ctx.profile);
+                    out.extend(lines);
+                }
                 if let Some(iface) = &iface {
                     let _ = run("ip", &["route", "del", "default", "dev", iface]);
                     let _ = run("ip", &["addr", "flush", "dev", iface]);

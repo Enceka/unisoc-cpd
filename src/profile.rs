@@ -115,6 +115,46 @@ impl Default for Mailbox {
     }
 }
 
+/// How the host has to be told about a bearer its own network stack did not
+/// bring up, and who is behind that bearer (see `src/nat.rs`).
+///
+/// Every name here is a platform name -- a table, a chain, a LAN interface --
+/// which is why they are profile keys rather than literals in the core: the A12
+/// gate in `profile_check` scans the core for exactly this vocabulary.  The one
+/// thing deliberately absent is the clients' subnets, because what a platform
+/// handed out at run time is a fact about a running system, not a setting.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Nat {
+    /// The owner's decision, like `nv.readonly`: while this is false, `data up`
+    /// leaves the host's networking alone and `data nat on` refuses.
+    pub enabled: bool,
+    /// The chain tethering ends in, where the platform has one: it carries a
+    /// catch-all DROP and an ACCEPT pair per uplink its own stack brought up.
+    pub forward_chain: Option<String>,
+    /// The routing table unmarked traffic actually reaches, where the platform
+    /// routes by policy.  Empty means `main` is the whole story.
+    pub route_table: Option<String>,
+    /// The LAN interfaces tethered clients arrive on.
+    pub clients: Vec<String>,
+    /// Metric for the host's own default route through the bearer.
+    pub metric: u32,
+}
+
+impl Default for Nat {
+    fn default() -> Self {
+        Self {
+            // Off unless a profile asks for it: this rewrites the host's
+            // networking, so the default has to be the do-nothing one.
+            enabled: false,
+            forward_chain: None,
+            route_table: None,
+            clients: Vec::new(),
+            metric: 100,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct DataPath {
@@ -123,6 +163,7 @@ pub struct DataPath {
     pub cid: u32,
     pub apn_source: Option<String>,
     pub vendor_script: Option<String>,
+    pub nat: Nat,
 }
 
 impl DataPath {

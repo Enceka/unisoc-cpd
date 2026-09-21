@@ -122,6 +122,32 @@ cid = 1
 apn_source = "/etc/e5/mobile-data.conf"
 vendor_script = "/opt/e5/mobile-data"
 
+# The Android side's network stack has its own opinion about which uplinks
+# exist, and a bearer this daemon brings up is a stranger to it.  Measured on
+# the unit (FINDINGS 25.8, re-checked 2026-09-21):
+#
+#   * `ip rule` 10000 sends unmarked traffic to `legacy_system`, while the
+#     default route sits in `main` -- so the host itself has an address and no
+#     way out;
+#   * the tether chain ends in a catch-all DROP, and netd only inserts ACCEPT
+#     pairs for uplinks its own stack brought up: 2670 client packets died
+#     there in one session;
+#   * and nothing masquerades clients arriving on a bearer the platform never
+#     handed out.
+#
+# All three names are platform names, which is why they are here and not in the
+# core: `profile-check` scans `src/` for exactly this vocabulary.
+[data.nat]
+enabled = true
+forward_chain = "tetherctrl_FORWARD"
+route_table = "legacy_system"
+# The hotspot's LAN.  Its subnet is read off the interface when the plan is
+# built rather than written here, because what the platform handed out is the
+# fact and a copy of it ages into a route for the wrong network.  The USB side
+# (`sipa_usb0`) carries no IPv4 address on this unit, so it is not a client LAN
+# until the platform gives it one.
+clients = ["wlan0"]
+
 [voice]
 # No UCM port yet, so there is no in-call audio path to route.
 supported = false

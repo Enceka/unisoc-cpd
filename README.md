@@ -160,7 +160,7 @@ systemctl stop e5-mobile-data-watch e5-mobile-data e5-atd
 
 | | |
 |---|---|
-| core (channel/at/telemetry/profile/CLI) | implemented, 119 tests green |
+| core (channel/at/telemetry/profile/CLI) | implemented, 129 tests green |
 | capabilities | `link`, `sim`, `register`, `signal`, `operator`, `cfun`, `band`, `nr`, `ims`, `sms`, `ussd`, `call`, `data`, `nv`, `diag`, `serve` |
 | URC decoding (contracts §9.2) | implemented and tested; `+ECIND:`/`+CMT:`/`+CDS:` deliberately kept raw rather than half-decoded |
 | G2 control plane (`serve`) | code and offline tests in place: resident ownership, URC events, capabilities over a socket, idle probes, `state` with `last_ok_age_s`. **Not yet on the device** — it has not been the owner of `/dev/stty_nr1` |
@@ -172,6 +172,7 @@ systemctl stop e5-mobile-data-watch e5-mobile-data e5-atd
 | log/dump spool drains, `stime_ch` | not implemented (W1, still open) |
 | voice | no audio route yet (`voice.supported = false`); the signaling half is measured — `ims status` reads `+CIREG` (the IMS-registration gate), `call` dials/answers/hangs up signal-only; **first MT VoLTE call answered under the daemon** (FINDINGS §14) |
 | W7 web UI | `web` serves the daemon over HTTP: inbox, SMS send, dial/answer/hangup, live URC stream, incoming-call banner — a socket client, never a channel owner (`units/unisoc-cpd-web.service`) |
+| host side of the bearer (`data nat`) | implemented and **measured on the Android side** (2026-09-21, RIL stopped): `on` installs 8/8 steps, a second `on` leaves one of each rule, `status` reads `nat: complete`, and `ping 223.5.5.5` answers 2/2 where neither routing table had a default route before (contracts §10). The Linux side's own `nat.nft` is untouched |
 
 ## Licence
 
