@@ -332,6 +332,16 @@ fn respond(w: &mut File, cmd: &str, urcs: &AtomicU64, state: &mut ModemState) {
             .parse()
             .unwrap_or(0);
         "OK\r\n".into()
+    } else if upper.starts_with("AT+CIREG?") {
+        "+CIREG: 0,1\r\nOK\r\n".into()
+    } else if upper == "ATA" {
+        "CONNECT\r\n".into()
+    } else if upper == "ATH" {
+        "OK\r\n".into()
+    } else if upper.starts_with("ATD") {
+        "CONNECT\r\n".into()
+    } else if upper.starts_with("AT+VTS=") {
+        "OK\r\n".into()
     } else if upper.starts_with("AT+SP5GCMDS") {
         "+SP5GCMDS: 0,0,1\r\nOK\r\n".into()
     } else {

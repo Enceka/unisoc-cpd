@@ -169,7 +169,7 @@ systemctl stop e5-mobile-data-watch e5-mobile-data e5-atd
 | on-device, read-only | verified on the handset: `diag spools` (8 nodes, all `char`), `diag mailbox`, `diag asserts` (0 CP asserts), `nv list` (7 partitions). Each run's summary shows `at.commands: 0` and `channels.cmd.opens: 0` — the AT channel is deliberately not touched while the vendor RIL owns it |
 | on-device, AT | **measured on the Android side** (2026-09-20): after `stop vendor.ril-daemon` the daemon was the only reader of both channels — `link`, `sim`, `band`, `serve` + socket clients all passed with 0 CP asserts and 50/50 URC lines decoded; the transfer rule and the stack cold-cycle requirement are in FINDINGS §1–§2. **Not yet at boot on the Linux side**, not soaked, no profile is `verified` |
 | log/dump spool drains, `stime_ch` | not implemented (W1, still open) |
-| voice | `voice.supported = false`: no UCM/voice route on this platform yet |
+| voice | no audio route yet (`voice.supported = false`); the signaling half is probed: `ims status` reads `+CIREG` (the IMS-registration gate), `call` dials/answers/hangs up signal-only without an audio route — the on-device reachability session is the next step (W4/W5) |
 
 ## Licence
 

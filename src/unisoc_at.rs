@@ -250,6 +250,17 @@ pub fn parse_volte(line: &str) -> Option<u32> {
     payload_ints(line).first().map(|v| *v as u32)
 }
 
+/// `AT+CIREG?` -> `+CIREG: <n>,<reg_state>` (27.007 §8.69): 1 = IMS
+/// registered, 0 = not registered.  This is the gate a VoLTE call waits on;
+/// provenance researched, the generation's own shape still to be measured.
+pub fn parse_ims_reg(line: &str) -> Option<u32> {
+    let mut ints = payload_ints(line);
+    if ints.len() < 2 {
+        return None;
+    }
+    Some(ints.remove(1) as u32)
+}
+
 fn dedup(bands: &[u32]) -> Vec<u32> {
     let mut v: Vec<u32> = bands.to_vec();
     v.sort_unstable();
@@ -335,5 +346,13 @@ mod tests {
         assert_eq!(Rat::parse("3g"), None);
         assert_eq!(parse_5g_sa("+SP5GRAN: 1"), Some(1));
         assert_eq!(parse_volte("+CAVIMS: 0"), Some(0));
+    }
+
+    #[test]
+    fn ims_reg_reads_the_state_field_not_the_reporting_flag() {
+        assert_eq!(parse_ims_reg("+CIREG: 0,1"), Some(1));
+        assert_eq!(parse_ims_reg("+CIREG: 0,0"), Some(0));
+        // a one-field answer carries no state to read
+        assert_eq!(parse_ims_reg("+CIREG: 0"), None);
     }
 }

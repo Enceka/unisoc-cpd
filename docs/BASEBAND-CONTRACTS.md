@@ -116,7 +116,8 @@ way it is:
 | operator | `AT+COPS?`, `AT+COPS=?`, `AT+COPS=0` | a full scan takes tens of seconds |
 | SMS | `AT+CMGF=1`, `AT+CMGL="ALL"`, `AT+CMGR=<i>`, `AT+CMGD=<i>`, `AT+CMGS="<n>"` | `+CMGS` answers with a bare `>` continuation prompt |
 | USSD | `AT+CUSD=1,"<code>",15` | `+CUSD: 0,"...",15` |
-| voice | `ATD<n>;`, `ATA`, `ATH`, `AT+CLCC`, `AT+VTS="<d>"` | CS only |
+| voice | `ATD<n>;`, `ATA`, `ATH`, `AT+CLCC`, `AT+VTS="<d>"` | CS only — and **NR SA has no CS domain**: on this network a call is VoLTE (IMS) or nothing, so the dial is expected to ride IMS once `+CIREG` reports registered (researched; §4.2) |
+| IMS registration | `AT+CIREG?` | `+CIREG: <n>,<reg_state>`; 1 = IMS registered — the gate a VoLTE dial waits for (researched) |
 | PDP | `AT+CGDCONT=1,"IPV4V6","<apn>"`, `AT+CGACT=1,1`, `AT+CGCONTRDP=1`, `AT+CGDATA="M-ETHER",1` | `+CGCONTRDP` fields: `cid,bearer,apn,"addr.mask",gw,dns1,dns2` |
 
 Measured bearer, for reference:
@@ -149,6 +150,7 @@ them has been sent to a handset yet.
 | cell lock | `AT+SPFORCEFRQ=<12\|16>,6,<freq>,<pci>` | 12 = LTE, 16 = NR |
 | cell unlock / read | `AT+SPFORCEFRQ=<12\|16>,4` / `,3` | `+SPFORCEFRQ: <rat>,3,<freq1>,<pci1>,…` |
 | 5G SA / NSA | `AT+SP5GRAN?` / `AT+SP5GRAN=<0\|1>` | 1 = SA allowed, 0 = NSA only |
+| VoLTE dial | `ATD<n>;` while IMS registered | expected Unisoc shape: the same dial, the CP picks IMS by voice domain; if refused, the alternate to try is `AT+CDV=<n>` (unconfirmed for this generation) |
 | 5G registration | `AT+C5GREG?` | `+C5GREG: <n>,<stat>,…` |
 | VoLTE | `AT+CAVIMS?` / `AT+CAVIMS=<0\|1>` | 1 = enabled |
 | VoNR | `AT+SP5GCMDS="get nr synch_param",42` / `"set nr param",45,<s>` | quoted vendor sub-command |

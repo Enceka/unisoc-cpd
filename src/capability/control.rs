@@ -713,24 +713,22 @@ impl Capability for Call {
     }
 
     fn run(&self, ctx: &mut Context, args: &[String]) -> Result<Outcome> {
-        if !ctx.profile.voice.supported {
-            let mut out = vec![
-                "voice is not marked supported in this profile".to_string(),
-                "AT call control is still reachable, but there is no in-call audio path"
-                    .to_string(),
-            ];
-            let session = ctx.at()?;
-            let r = session.command("AT+CLCC", Duration::from_secs(8), &[], 0);
-            emit(&mut out, "AT+CLCC", &r);
-            ctx.note("voice.supported = false in the profile: no UCM/voice route on this platform");
-            return Ok(outcome(out, r.ok()));
-        }
-
+        let audio = ctx.profile.voice.supported;
         let session = ctx.at()?;
         let pos = positionals(args);
         let action = pos.first().map(|s| s.as_str()).unwrap_or("list");
         let expect_connect = vec!["CONNECT".to_string()];
         let mut out = Vec::new();
+        if !audio {
+            // Call signaling is measurable without an audio path; the audio
+            // itself is the platform hook that is the other half of W4.
+            out.push(
+                "no audio route in this profile (voice.supported = false): \
+                 signaling only -- the far end may hear silence"
+                    .to_string(),
+            );
+            ctx.note("voice.supported = false: no UCM/voice route on this platform");
+        }
         let ok;
 
         match action {

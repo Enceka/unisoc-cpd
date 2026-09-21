@@ -116,6 +116,23 @@ fn ims_status_probes_volte_and_vonr() {
     assert!(stdout.contains("+CAVIMS: 0"), "stdout:\n{stdout}");
     assert!(stdout.contains("VoLTE disabled"), "stdout:\n{stdout}");
     assert!(stdout.contains("+SP5GCMDS"), "stdout:\n{stdout}");
+    assert!(stdout.contains("+CIREG: 0,1"), "stdout:\n{stdout}");
+    assert!(stdout.contains("IMS registered"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn call_dials_and_hangs_up_signaling_only_without_an_audio_route() {
+    let r = rig("radio-call");
+    let out = run(&r.dir, "call", &["dial", "18600000000"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout:\n{stdout}");
+    assert!(stdout.contains("ATD18600000000;"), "stdout:\n{stdout}");
+    assert!(stdout.contains("signaling only"), "stdout:\n{stdout}");
+
+    let out = run(&r.dir, "call", &["hangup"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout:\n{stdout}");
+    assert!(stdout.contains("ATH"), "stdout:\n{stdout}");
 }
 
 #[test]

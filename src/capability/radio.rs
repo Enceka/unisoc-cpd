@@ -276,7 +276,7 @@ impl Capability for Ims {
     }
 
     fn summary(&self) -> &'static str {
-        "VoLTE/VoNR probe and switch: status|volte on|off|vonr on|off (W5: it works, or it does not)"
+        "VoLTE/VoNR probe and switch, IMS registration: status|volte on|off|vonr on|off (W5: it works, or it does not)"
     }
 
     fn run(&self, ctx: &mut Context, args: &[String]) -> Result<Outcome> {
@@ -300,6 +300,17 @@ impl Capability for Ims {
                         }
                     ));
                 }
+                // +CIREG is the gate a VoLTE call waits on: without an IMS
+                // registration there is nothing for a dial to ride.
+                let imsreg = session.command("AT+CIREG?", Duration::from_secs(8), &[], 0);
+                emit(&mut out, "AT+CIREG?", &imsreg);
+                let verdict = match imsreg.first_with_prefix("+CIREG:").and_then(unisoc_at::parse_ims_reg) {
+                    Some(1) => "registered: a VoLTE dial is the next thing to try".to_string(),
+                    Some(0) => "not registered: nothing is up for a dial to ride".to_string(),
+                    Some(state) => format!("in state {state} (shape not yet measured)"),
+                    None => "unknown shape (researched, not yet measured on this generation)".to_string(),
+                };
+                out.push(format!("  -> IMS {verdict}"));
                 // VoNR is a vendor command in a quoted form; the answer is
                 // only meaningful when the modem already answered +SP5GCMDS.
                 let vonr = session.command(
@@ -309,7 +320,7 @@ impl Capability for Ims {
                     0,
                 );
                 emit(&mut out, "AT+SP5GCMDS=\"get nr synch_param\",42", &vonr);
-                ok = volte.ok();
+                ok = volte.ok() && imsreg.ok();
             }
             "volte" => {
                 let Some(setting) = pos.get(1) else {
