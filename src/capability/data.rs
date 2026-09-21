@@ -68,6 +68,134 @@ pub fn parse_cgcontrdp(line: &str) -> Option<Context5> {
     })
 }
 
+/// An IPv6 address in the spelling 27.007 uses inside `+CGCONTRDP`: sixteen
+/// bytes in dotted decimal, not the `a:b:c` form and not the IPv4 one.
+///
+/// Measured on the unit: an IPV4V6 context answers with **two** `+CGCONTRDP`
+/// lines, the second of which carries
+/// `0.0.0.0.0.0.0.0.<eight more bytes>...` in its local-address field.  That is
+/// neither a v4 address (eight groups, not four) nor a v6 literal, so both of
+/// the obvious readers miss it and the bearer looks IPv4-only while the CP is
+/// reporting IPv6 perfectly well.
+///
+/// A field of 32 groups is the spec's `<local_addr and subnet mask>`: the
+/// address first, then its mask.  Only the address is returned; the mask is
+/// read by nothing here, and pretending otherwise would be inventing a prefix
+/// length this code never checked.
+pub fn ipv6_octets(field: &str) -> Option<String> {
+    let parts: Vec<&str> = field.split('.').collect();
+    if parts.len() != 16 && parts.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (i, part) in parts.iter().take(16).enumerate() {
+        // A group that is not a byte (over 255, or not a number) means this
+        // field is not the octet spelling at all.
+        bytes[i] = part.trim().parse::<u8>().ok()?;
+    }
+    let addr = std::net::Ipv6Addr::from(bytes);
+    // An all-zero address is how a line says "no IPv6 in this one".
+    if addr.is_unspecified() {
+        return None;
+    }
+    Some(addr.to_string())
+}
+
+/// The IPv6 address a `+CGCONTRDP` answer carries, from whichever of its lines
+/// has one, in whichever spelling that line uses.
+///
+/// The local-address field is the one 27.007 defines, so the readers here look
+/// only at it: a scan of the whole answer for anything that looks like IPv6
+/// would find a v6 *name server* on a context that has no address and print it
+/// in the address row.
+pub fn ipv6_from_context(lines: &[String]) -> Option<String> {
+    for line in lines.iter().filter(|l| l.contains("+CGCONTRDP:")) {
+        let field = context_field(line, 3)?;
+        if let Some(addr) = ipv6_octets(&field) {
+            return Some(addr);
+        }
+        // The other two spellings seen in the wild: `addr.prefix`, and a bare
+        // v6 literal.
+        if !field.contains(':') {
+            continue;
+        }
+        let candidate = match field.split_once('.') {
+            Some((addr, prefix))
+                if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) =>
+            {
+                addr
+            }
+            _ => field.as_str(),
+        };
+        if let Ok(v6) = candidate.parse::<std::net::Ipv6Addr>() {
+            return Some(v6.to_string());
+        }
+    }
+    None
+}
+
+/// The IPv6 resolvers a `+CGCONTRDP` answer carries.
+///
+/// They live on the same line as the address and in the same octet spelling,
+/// which is why the line is identified by its address field rather than by a
+/// position: the v4 line's name servers are v4 addresses in the v4 spelling.
+pub fn ipv6_dns(lines: &[String]) -> Option<String> {
+    for line in lines.iter().filter(|l| l.contains("+CGCONTRDP:")) {
+        if context_field(line, 3).and_then(|f| ipv6_octets(&f)).is_none() {
+            continue;
+        }
+        let dns: Vec<String> = [5usize, 6]
+            .iter()
+            .filter_map(|i| context_field(line, *i))
+            .filter_map(|f| ipv6_octets(&f))
+            .collect();
+        if !dns.is_empty() {
+            return Some(dns.join(","));
+        }
+    }
+    None
+}
+
+/// Field `i` of a `+CGCONTRDP` line, unquoted.
+fn context_field(line: &str, i: usize) -> Option<String> {
+    let (_, body) = line.split_once(':')?;
+    body.split(',')
+        .nth(i)
+        .map(|f| f.trim().trim_matches('"').to_string())
+}
+
+/// The IPv6 address `ip -6 addr` reports for an interface, preferring a global
+/// one.  A link-local address is a fact, but it is not the answer to "does this
+/// bearer have IPv6", so it is only used when there is nothing else.
+pub fn interface_ipv6(text: &str) -> Option<String> {
+    let mut link_local = None;
+    for line in text.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        for (i, word) in words.iter().enumerate() {
+            if *word != "inet6" {
+                continue;
+            }
+            let Some(token) = words.get(i + 1) else {
+                continue;
+            };
+            let addr = token.split('/').next().unwrap_or(token);
+            let Ok(v6) = addr.parse::<std::net::Ipv6Addr>() else {
+                continue;
+            };
+            if v6.is_loopback() {
+                continue;
+            }
+            let value = v6.to_string();
+            if v6.is_unicast_link_local() {
+                link_local.get_or_insert(value);
+            } else {
+                return Some(value);
+            }
+        }
+    }
+    link_local
+}
+
 /// Dotted netmask -> prefix length.  A wrong prefix leaves the interface with
 /// /32 and no on-link subnet, which is a silent, total failure of the bearer.
 pub fn mask_to_prefix(mask: Ipv4Addr) -> u8 {
@@ -769,9 +897,23 @@ impl Capability for Data {
                         .filter(|d| !d.is_empty())
                         .unwrap_or_else(dash)
                 ));
+                // IPv6 is a separate fact from IPv4 on the same context: an
+                // IPV4V6 bearer can hand out one without the other, so the two
+                // are reported apart and neither is inferred from its sibling.
+                // The CP answers with one line per family, which is why the
+                // reader takes the whole reply and not just its first line.
+                let v6 = rdp.as_ref().and_then(|r| ipv6_from_context(&r.lines));
+                let v6_dns = rdp.as_ref().and_then(|r| ipv6_dns(&r.lines));
+                out.push(format!("ip6: {}", or_dash(v6)));
+                out.push(format!("ip6_dns: {}", or_dash(v6_dns)));
                 if let Some(iface) = &iface {
                     let (_, addr) = run("ip", &["-br", "addr", "show", iface]);
                     out.push(format!("interface {iface}: {addr}"));
+                    let (_, v6if) = run("ip", &["-6", "-o", "addr", "show", "dev", iface]);
+                    out.push(format!(
+                        "ip6_interface: {}",
+                        or_dash(interface_ipv6(&v6if))
+                    ));
                     let (_, route) = run("ip", &["route", "show", "dev", iface]);
                     out.push(format!("routes: {}", route.replace('\n', " | ")));
                 }
@@ -1090,6 +1232,78 @@ impl Capability for Data {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shape measured on the unit: an IPV4V6 context answers with one line
+    /// per family, and the v6 line carries the address as sixteen bytes in
+    /// dotted decimal.  Documentation addresses only -- this file names no
+    /// device, and neither does its fixture.
+    fn measured_reply() -> Vec<String> {
+        vec![
+            "+CGCONTRDP: 1,0,cbnet,10.99.0.2.255.0.0.0,,43.239.172.1,43.239.172.2,,,,,0,,0,,,,0,2,1,0,1,0,0,0"
+                .to_string(),
+            // 2001:db8::1 and its mask, then 2001:db8::53 / ::54 as resolvers
+            "+CGCONTRDP: 1,0,cbnet,\
+             32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0,,\
+             32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.53,32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.54"
+                .to_string(),
+        ]
+    }
+
+    #[test]
+    fn the_context_ipv6_is_read_from_the_octet_spelling() {
+        let reply = measured_reply();
+        assert_eq!(ipv6_from_context(&reply).as_deref(), Some("2001:db8::1"));
+        assert_eq!(
+            ipv6_dns(&reply).as_deref(),
+            // the octet groups are *decimal*: 53 in the fixture is byte 0x35
+            Some("2001:db8::35,2001:db8::36")
+        );
+    }
+
+    /// A v4-only answer, and one with an answer at all, must not produce a v6
+    /// address: the v4 line's own fields are four groups, not sixteen.
+    #[test]
+    fn a_v4_answer_carries_no_ipv6() {
+        let v4_only = vec![
+            "+CGCONTRDP: 1,0,cbnet,10.99.0.2.255.0.0.0,,43.239.172.1,43.239.172.2".to_string(),
+        ];
+        assert_eq!(ipv6_from_context(&v4_only), None);
+        assert_eq!(ipv6_dns(&v4_only), None);
+        assert_eq!(ipv6_from_context(&["ERROR".to_string()]), None);
+    }
+
+    #[test]
+    fn the_octet_spelling_is_exactly_sixteen_bytes() {
+        // four groups is a v4 address and its mask, which is what the v4 line
+        // carries in the same field
+        assert_eq!(ipv6_octets("10.99.0.2.255.0.0.0"), None);
+        // an all-zero field is how a line says it has no address of this family
+        assert_eq!(ipv6_octets("0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0"), None);
+        // 999 is not a byte, so this field is not the octet spelling
+        assert_eq!(ipv6_octets("32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.999"), None);
+        // and the literal spelling is not this reader's job
+        assert_eq!(ipv6_octets("2001:db8::1"), None);
+        assert_eq!(ipv6_octets(""), None);
+    }
+
+    #[test]
+    fn the_interface_ipv6_prefers_a_global_address() {
+        let link_only = "32: wwan0    inet6 fe80::1/64 scope link\n       valid_lft forever\n";
+        assert_eq!(
+            interface_ipv6(link_only).as_deref(),
+            Some("fe80::1"),
+            "a link-local address is still all the interface has"
+        );
+        let both = "32: wwan0    inet6 fe80::1/64 scope link\n\
+                    32: wwan0    inet6 2001:db8::5/64 scope global\n";
+        assert_eq!(
+            interface_ipv6(both).as_deref(),
+            Some("2001:db8::5"),
+            "the global one is the answer, whichever order it arrives in"
+        );
+        assert_eq!(interface_ipv6("1: lo    inet6 ::1/128 scope host\n"), None);
+        assert_eq!(interface_ipv6(""), None);
+    }
 
     #[test]
     fn cgcontrdp_is_parsed() {
