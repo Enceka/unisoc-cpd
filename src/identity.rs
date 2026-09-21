@@ -40,6 +40,61 @@ pub fn nv_read_frame(item_hex: &str) -> Result<Vec<u8>> {
 /// One request/response round trip on a diag character node, with an overall
 /// deadline.  The reply is whatever arrived between the leading 0x7E and the
 /// next one (or everything seen, when the frame never closes).
+/// One AT question on one tty node, answered with its lines.
+///
+/// `diag_exchange` speaks the diag framing; this speaks AT, on a node that is
+/// not one of the resident channels.  The per-slot identity read opens the
+/// slot's own channel for the length of one question -- the same shape the
+/// vendor RIL uses, one channel set per card -- and closes it again, so the
+/// one-reader rule holds per node.
+pub fn at_lines(path: &Path, command: &str, timeout: Duration) -> Result<Vec<String>> {
+    use crate::channel::set_raw;
+    use std::io::{Read as _, Write as _};
+
+    let mut dev = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("opening AT channel {}", path.display()))?;
+    set_raw(dev.as_raw_fd());
+    dev.write_all(format!("{command}\r").as_bytes())
+        .with_context(|| format!("writing to {}", path.display()))?;
+
+    let deadline = Instant::now() + timeout;
+    let mut acc = String::new();
+    let mut buf = [0u8; 512];
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            bail!("AT {}: no reply within {timeout:?}", path.display());
+        }
+        let mut fds = [libc::pollfd {
+            fd: dev.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let ms = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
+        if unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) } < 0 {
+            bail!("AT {}: poll failed", path.display());
+        }
+        let n = dev.read(&mut buf)?;
+        acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+        // `OK` / `ERROR` end an answer; an EOF means the node had nothing more.
+        if acc
+            .split_whitespace()
+            .any(|w| w == "OK" || w.contains("ERROR"))
+            || n == 0
+        {
+            break;
+        }
+    }
+    Ok(acc
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case(command))
+        .collect())
+}
+
 pub fn diag_exchange(path: &Path, request: &[u8], timeout: Duration) -> Result<Vec<u8>> {
     let mut dev = OpenOptions::new()
         .read(true)

@@ -71,18 +71,49 @@ pub enum ItemRead<'a> {
 pub fn render_item(index: u32, item_id: &str, read: ItemRead<'_>) -> String {
     let head = format!("imei{index} ({}, item {item_id})", sim_slot_label(index));
     match read {
-        ItemRead::Value(value) => format!(
-            "{head} = {value}{}",
-            if identity::luhn_valid(value) {
-                ""
-            } else {
-                "  (LUHN INVALID -- treat with suspicion)"
-            }
-        ),
+        ItemRead::Value(value) => format!("{head} = {value}{}", luhn_suffix(value)),
         ItemRead::NotProvisioned => {
             format!("{head}: not provisioned (the NV item reads all zeros)")
         }
         ItemRead::Failed(error) => format!("{head}: {error}"),
+    }
+}
+
+fn luhn_suffix(value: &str) -> &'static str {
+    if identity::luhn_valid(value) {
+        ""
+    } else {
+        "  (LUHN INVALID -- treat with suspicion)"
+    }
+}
+
+/// The value that came over AT instead of the NV item.
+///
+/// The head names the source, because provenance is part of the answer: the
+/// diag item is the handset's own record, while an AT answer is the CP's word
+/// about a slot -- and on this generation the CP routes that command to the
+/// active card, so the two can disagree.
+pub fn render_at_item(index: u32, value: &str) -> String {
+    format!(
+        "imei{index} ({} · via AT) = {value}{}",
+        sim_slot_label(index),
+        luhn_suffix(value)
+    )
+}
+
+/// Substitute the profile's per-slot read template.  Pure, testable.
+pub fn render_read_command(template: &str, index: u32) -> String {
+    template.replace("{index}", &index.to_string())
+}
+
+/// The emitted form of a question asked on a one-off channel.  The node is part
+/// of the answer's provenance, and the emitted lines keep the resident
+/// channel's convention -- `>` for the command, indented replies -- so a client
+/// skips them the same way.
+fn emit_lines(out: &mut Vec<String>, node: &std::path::Path, cmd: &str, lines: &[String]) {
+    out.push(format!("> {node:?} {cmd}"));
+    for line in lines {
+        out.push(format!("  {line}"));
     }
 }
 
@@ -201,23 +232,97 @@ impl Capability for Imei {
                     .transpose()
                     .map_err(|_| anyhow::anyhow!("--index expects 0, 1 or 2"))?;
                 let mut any = false;
-                for it in &ctx.profile.nv.imei_items {
+                let mut via_at = false;
+                // Cloned so the AT fallback can borrow the context mutably
+                // while the loop walks the profile's own list.
+                let items = ctx.profile.nv.imei_items.clone();
+                let at_read = ctx.profile.imei.read_template();
+                for it in &items {
                     if wanted.is_some_and(|w| w != it.index) {
                         continue;
                     }
                     // Three outcomes, kept apart on purpose: a value, an item
                     // that was never provisioned, and a read that failed.  The
                     // first is the identity, the second is a fact about the
-                    // handset, the third is a fact about the read.
+                    // handset, the third is a fact about the read.  When the
+                    // item says nothing and the profile names an AT read, there
+                    // is a fourth source: the CP's own word about that slot,
+                    // labelled as such rather than passed off as the item's.
                     let line = match read_item(ctx, it.index) {
                         Ok(value) if is_provisioned(&value) => {
                             any = true;
                             render_item(it.index, &it.id, ItemRead::Value(&value))
                         }
-                        Ok(_) => render_item(it.index, &it.id, ItemRead::NotProvisioned),
-                        Err(e) => render_item(it.index, &it.id, ItemRead::Failed(&format!("{e:#}"))),
+                        outcome => {
+                            let at_value = match (&at_read, &it.channel) {
+                                // The slot has its own channel: ask there, the
+                                // way the vendor RIL does -- one channel set per
+                                // card, opened for the length of the question.
+                                (Some(template), Some(node)) => {
+                                    let cmd = render_read_command(template, it.index);
+                                    let node = std::path::PathBuf::from(node);
+                                    match identity::at_lines(&node, &cmd, Duration::from_secs(6)) {
+                                        Ok(lines) => {
+                                            emit_lines(&mut out, &node, &cmd, &lines);
+                                            lines
+                                                .iter()
+                                                .find(|l| {
+                                                    l.len() == 15
+                                                        && l.bytes().all(|b| b.is_ascii_digit())
+                                                })
+                                                .cloned()
+                                        }
+                                        Err(e) => {
+                                            ctx.note(format!(
+                                                "reading {node:?} did not answer: {e:#}"
+                                            ));
+                                            None
+                                        }
+                                    }
+                                }
+                                // No own channel, no AT read: on this CP every
+                                // resident channel answers as the *active*
+                                // card (measured across stty_nr2..nr26), so an
+                                // answer taken there would be the active
+                                // card's identity wearing this slot's label.
+                                (Some(_), None) => {
+                                    ctx.note(
+                                        "the item has no own AT channel, and the resident \
+                                         channels all answer as the active card: no per-slot \
+                                         AT read is possible"
+                                            .to_string(),
+                                    );
+                                    None
+                                }
+                                (None, _) => None,
+                            };
+                            match at_value {
+                                Some(value) => {
+                                    any = true;
+                                    via_at = true;
+                                    render_at_item(it.index, &value)
+                                }
+                                None => match outcome {
+                                    Ok(_) => {
+                                        render_item(it.index, &it.id, ItemRead::NotProvisioned)
+                                    }
+                                    Err(e) => render_item(
+                                        it.index,
+                                        &it.id,
+                                        ItemRead::Failed(&format!("{e:#}")),
+                                    ),
+                                },
+                            }
+                        }
                     };
                     out.push(line);
+                }
+                if via_at {
+                    ctx.note(
+                        "an identity came over AT rather than the NV item: the CP routes \
+                         SPACTCARD reads to the active card, so the slot label is its word"
+                            .to_string(),
+                    );
                 }
                 ctx.event("imei-read", out.join(" | "));
                 if any {
@@ -363,6 +468,26 @@ impl Capability for Imei {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_at_read_labels_its_source() {
+        assert_eq!(
+            render_at_item(1, "490154203237518"),
+            "imei1 (SIM 2 · via AT) = 490154203237518"
+        );
+        assert!(
+            render_at_item(1, "490154203237519").contains("LUHN INVALID"),
+            "an AT answer is checked exactly like an NV one"
+        );
+    }
+
+    #[test]
+    fn the_read_template_substitutes_the_slot() {
+        assert_eq!(
+            render_read_command("AT+SPACTCARD={index};AT+CGSN", 1),
+            "AT+SPACTCARD=1;AT+CGSN"
+        );
+    }
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

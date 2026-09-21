@@ -201,6 +201,12 @@ pub struct ImeiItem {
     pub index: u32,
     /// The item id as four hex digits, exactly as the diag frame carries it.
     pub id: String,
+    /// The AT channel this slot's identity is read on, when the slot has its
+    /// own.  Measured on the unit from the vendor RIL's own numbering
+    /// (impl-ril/common/atchannel.h): the channels are dealt out per card --
+    /// URC, then two command channels -- so a second slot's identity is read
+    /// on its channel, not on the first card's.
+    pub channel: Option<String>,
 }
 
 /// The identity surface of this platform: what to probe, and — only once it
@@ -211,6 +217,10 @@ pub struct Imei {
     /// Read-form commands `imei probe` sends when this list is non-empty;
     /// the core's default probe list is used when it is empty.
     pub probes: Vec<String>,
+    /// The per-slot AT read, used when a diag identity item says nothing:
+    /// `{index}` is the zero-based slot.  Absent means "no AT read contract",
+    /// and `imei read` then reports the item's own outcome and nothing more.
+    pub read_command: Option<String>,
     /// The write command template; `{imei}` and `{index}` are substituted.
     /// Empty/absent means "no verified write contract on this platform", and
     /// `imei write` refuses — nothing is guessed from probe answers.
@@ -222,6 +232,14 @@ impl Imei {
     /// hold it while using `ctx` mutably for the backup and the write.
     pub fn write_template(&self) -> Option<String> {
         self.write_command
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// The per-slot AT read, when the profile names one.
+    pub fn read_template(&self) -> Option<String> {
+        self.read_command
             .as_ref()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())

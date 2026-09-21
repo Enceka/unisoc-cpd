@@ -214,6 +214,11 @@ fn respond(
     }
     let body: String = if upper == "AT" {
         "OK\r\n".into()
+    } else if upper.starts_with("AT+SPACTCARD=") {
+        // the vendor helper's per-slot router (uficode/RootSttyAT.kt): the
+        // answer is a placeholder identity, and which slot it names is the
+        // CP's business, not the rig's
+        "490154203237518\r\nOK\r\n".into()
     } else if upper.starts_with("AT+CGMM") {
         // Placeholder identity: the rig must never carry a real CP model or
         // firmware revision, for the same reason tests carry no real IMEI.

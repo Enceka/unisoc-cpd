@@ -633,10 +633,20 @@ fn imei_entries(output: &[String]) -> Vec<Value> {
         let Ok(index) = index.parse::<u32>() else {
             continue;
         };
+        // The parens carry the slot and, when the value came over AT, its
+        // provenance: `(SIM 2, item 5e82)` or `(SIM 2 · via AT)`.  Either way
+        // the slot is the text up to the first comma, or the whole of it.
         let slot = tail
             .split_once('(')
-            .and_then(|(_, r)| r.split_once(','))
-            .map(|(s, _)| s.trim().to_string());
+            .and_then(|(_, r)| r.split_once(')'))
+            .map(|(inner, _)| {
+                inner
+                    .split_once(',')
+                    .map(|(s, _)| s)
+                    .unwrap_or(inner)
+                    .trim()
+                    .to_string()
+            });
         let (value, detail) = match tail.split_once(" = ") {
             Some((_, v)) => (
                 v.trim()
@@ -999,17 +1009,17 @@ pre{background:#EDE6F4;color:var(--on);border-radius:var(--r-s);padding:12px;mar
    card rather than wrapping, because wrapping is what would cost the alignment
    the table exists for. */
 .scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:8px 0}
-.tbl{border-collapse:collapse;width:100%;min-width:470px;font-size:.75rem}
-.tbl th,.tbl td{padding:7px 9px;text-align:left;white-space:nowrap;
+.tbl{border-collapse:collapse;width:100%;font-size:.6875rem}
+.tbl th,.tbl td{padding:4px 5px;text-align:left;white-space:nowrap;
   border-bottom:1px solid rgba(121,116,126,.16)}
 .tbl th{font-size:.6875rem;font-weight:500;color:var(--on-v);background:var(--sc-low)}
 .tbl th:first-child{border-top-left-radius:var(--r-s)}
 .tbl th:last-child{border-top-right-radius:var(--r-s)}
 .tbl th .u{display:block;font-size:.625rem;font-weight:400;opacity:.75}
 .tbl .num{text-align:right;font-variant-numeric:tabular-nums}
-.tbl .act{text-align:left;width:1%;padding-right:2px}
+.tbl .act{text-align:right;width:1%;padding-left:2px}
 .tbl tbody tr:last-child td{border-bottom:0}
-.tbl td .btn{height:28px;padding:0 12px;font-size:.6875rem}
+.tbl td .btn{height:24px;padding:0 9px;font-size:.625rem}
 .tbl .note{font-size:.6875rem;color:var(--on-v);padding:6px 0}
 
 #banner{display:none;position:fixed;inset:0;z-index:20;align-items:center;justify-content:center;
@@ -1328,29 +1338,28 @@ function neighborTable(el, d){
     el.innerHTML = '<div class="note">CP 未上报邻区列表（SPENGMD 邻区查询无应答，或本代不支持）</div>';
     return;
   }
-  // The lock button is the point of the table, so it is the first column: a
-  // narrow screen scrolls the numbers sideways, and an action that scrolls out
-  // of reach is an action nobody takes.
+  // The lock button sits at the row's end, where a reading eye finishes: it
+  // takes the row it belongs to with it.
   const rows = ns.map(function(n){
     const attrs = ' data-rat="' + (n.rat==='NR' ? 'nr':'lte') + '" data-freq="' + n.earfcn
       + '" data-pci="' + n.pci + '"';
     const call = 'lockNeighbor(this.getAttribute(\'data-rat\'),'
       + 'this.getAttribute(\'data-freq\'),this.getAttribute(\'data-pci\'))';
-    return '<tr><td class="act"><button class="btn tonal sm"' + attrs
-      + ' onclick="' + call + '">锁</button></td>'
-      + '<td>' + esc(n.rat) + '</td><td>' + esc(n.band||'—') + '</td>'
+    return '<tr><td>' + esc(n.rat) + '</td><td>' + esc(n.band||'—') + '</td>'
       + '<td class="num">' + n.earfcn + '</td><td class="num">' + n.pci + '</td>'
       + '<td class="num">' + n.rsrp + '</td><td class="num">' + n.rsrq + '</td>'
-      + '<td class="num">' + (n.sinr==null ? '—' : n.sinr) + '</td></tr>';
+      + '<td class="num">' + (n.sinr==null ? '—' : n.sinr) + '</td>'
+      + '<td class="act"><button class="btn tonal sm"' + attrs
+      + ' onclick="' + call + '">锁</button></td></tr>';
   }).join('');
   const header = ns.length
     ? '<div class="scroll"><table class="tbl" aria-label="邻区列表，每行可锁定">'
-      + '<thead><tr><th class="act"></th><th>RAT</th><th>band</th>'
+      + '<thead><tr><th>RAT</th><th>band</th>'
       + '<th class="num">EARFCN</th><th class="num">PCI</th>'
       + '<th class="num">RSRP<span class="u">dBm</span></th>'
       + '<th class="num">RSRQ<span class="u">dB</span></th>'
       + '<th class="num">SINR<span class="u">dB</span></th>'
-      + '</tr></thead><tbody>' + rows + '</tbody></table></div>'
+      + '<th class="act"></th></tr></thead><tbody>' + rows + '</tbody></table></div>'
     : '<div class="note">范围内没有读到邻区</div>';
   el.innerHTML = '<div class="note">' + counts + '</div>' + header;
 }
@@ -1600,6 +1609,17 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("no 15-digit identity"));
+    }
+
+    /// An AT-sourced identity keeps its provenance in the slot label, so the
+    /// panel shows where the value came from rather than passing it off as the
+    /// NV item's.
+    #[test]
+    fn imei_entries_name_the_at_source() {
+        let out = lines(&["imei1 (SIM 2 · via AT) = 490154203237518"]);
+        let entry = &imei_entries(&out)[0];
+        assert_eq!(entry["slot"], "SIM 2 · via AT");
+        assert_eq!(entry["value"], "490154203237518");
     }
 
     /// A check-digit failure is reported, not silently rounded away.

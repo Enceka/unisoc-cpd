@@ -101,7 +101,7 @@ struct Shared {
 /// Put a descriptor into raw mode (`stty raw -echo`) on the open fd.
 ///
 /// A spool device may not be a tty at all; that is not an error.
-fn set_raw(fd: RawFd) {
+pub(crate) fn set_raw(fd: RawFd) {
     unsafe {
         let mut t: libc::termios = std::mem::zeroed();
         if libc::tcgetattr(fd, &mut t) != 0 {

@@ -79,7 +79,7 @@ diag_node = "/dev/sdiag_nr"
 # individually provisioned here).
 imei_items = [
   { index = 0, id = "5e81" },
-  { index = 1, id = "5e82" },
+  { index = 1, id = "5e82", channel = "/dev/stty_nr4" },
   { index = 2, id = "5e90" },
 ]
 
@@ -90,6 +90,14 @@ imei_items = [
 # zero-based slot, {imei} the 15-digit value.  (Not found in the researched
 # AT surface; it came from the factory path, which is the better provenance.)
 write_command = 'AT+SPIMEI={index},"{imei}"'
+# The per-slot AT read, used when a diag identity item reads nothing.  The
+# command is the vendor RIL's own (impl-ril/ril_misc.c requestDeviceIdentify):
+# a plain AT+CGSN, sent on the slot's *own* channel -- the channels are dealt
+# out per card (impl-ril/common/atchannel.h: URC first, then two command
+# channels, and the block repeats per SIM), which is why item 1 names its
+# channel below.  `AT+SPACTCARD=<n>;AT+CGSN` was also measured and is refused
+# by this CP (CME 65536014); see the probes note.
+read_command = 'AT+CGSN'
 # Read-form probes.  SPACTCARD is this surface's per-slot router: a command
 # prefixed AT+SPACTCARD=<phoneId>; executes against that card's context --
 # but measured on the unit it only ever serves the ACTIVE card, so per-slot
