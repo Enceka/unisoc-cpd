@@ -200,6 +200,9 @@ const PAGE: &str = r#"<!doctype html>
  body{font-family:system-ui,sans-serif;background:#111;color:#ddd;margin:0;padding:12px}
  h1{font-size:18px} h2{font-size:15px;margin:14px 0 6px}
  .chips span{display:inline-block;background:#1d2b1d;border:1px solid #2e4d2e;border-radius:10px;padding:2px 10px;margin:2px;font-size:12px}
+ .chips span.ok{background:#163416;border-color:#3f7f3f;color:#b8e6b8}
+ .chips span.bad{background:#3d1515;border-color:#8f3f3f;color:#f0b8b8}
+ .chips span.dim{opacity:.55}
  pre{background:#181818;border:1px solid #333;border-radius:6px;padding:8px;min-height:14px;max-height:220px;overflow:auto;font-size:12px;white-space:pre-wrap}
  input,button{font-size:14px;border-radius:6px;border:1px solid #444;background:#222;color:#eee;padding:6px 10px;margin:2px}
  button{cursor:pointer;background:#28422a} button.red{background:#5a2323}
@@ -208,7 +211,9 @@ const PAGE: &str = r#"<!doctype html>
  .msg{border-bottom:1px solid #2a2a2a;padding:6px 2px;font-size:13px}
  .from{color:#8bc78b}
 </style></head><body>
-<h1>unisoc-cpd <span id="chips" class="chips"></span></h1>
+<h1>unisoc-cpd</h1>
+<div class="chips" id="radio">…</div>
+<div class="chips" id="chips"></div>
 <div id="banner"><div id="bnr-txt" style="font-size:24px">+CRING: VOICE</div>
  <button onclick="act('answer')">接听</button><button class="red" onclick="act('hangup')">挂断</button></div>
 
@@ -223,10 +228,8 @@ const PAGE: &str = r#"<!doctype html>
 <button onclick="act('answer')">接听</button>
 <button class="red" onclick="act('hangup')">挂断</button></div><pre id="call-out"></pre>
 
-<h2>状态（register / signal / ims）</h2>
-<div><button onclick="status()">刷新状态</button></div><pre id="stat-out"></pre>
-
 <h2>事件流（urc）</h2><pre id="urc-out">…</pre>
+<h2>状态详情</h2><pre id="stat-out">…</pre>
 
 <script>
 function out(id, resp){ document.getElementById(id).textContent =
@@ -236,21 +239,57 @@ async function get(u){ const r = await fetch(u); return r.json(); }
 async function post(u, data){ const r = await fetch(u, {method:'POST',
   headers:{'Content-Type':'application/x-www-form-urlencoded'},
   body: new URLSearchParams(data).toString()}); return r.json(); }
+function chip(list, label, cls){
+  return '<span class="'+(cls||'')+'">'+label+'</span>'; }
 async function refreshState(){ try{ const d = await get('/api/state'); const s = d.state||{};
   const a = s.at||{}; const c = (s.channels||{}).cmd||{};
+  const age = (s.last_ok_age_s==null) ? 'never' : Math.round(s.last_ok_age_s)+'s';
   document.getElementById('chips').innerHTML =
-    '<span>AT ok '+ (a.ok||0) +'/'+ (a.commands||0) +'</span>' +
-    '<span>timeout ' + (a.timeouts||0) + '</span>' +
-    '<span>opens ' + (c.opens||0) + '</span>' +
-    '<span>last_ok ' + (s.last_ok_age_s==null ? 'never' : Math.round(s.last_ok_age_s)+'s') + '</span>';
+    chip(0,'AT ok '+ (a.ok||0) +'/'+ (a.commands||0)) +
+    chip(0,'timeout ' + (a.timeouts||0), (a.timeouts||0)>0?'bad':'ok') +
+    chip(0,'opens ' + (c.opens||0)) +
+    chip(0,'last_ok ' + age, (s.last_ok_age_s!=null && s.last_ok_age_s<120)?'ok':'dim');
  }catch(e){} }
+async function refreshStatus(){ try{ const d = await get('/api/status');
+  const ro = (d.register.output||[]).join(' ');
+  const so = (d.signal.output||[]).join(' ');
+  const io = (d.ims.output||[]).join(' ');
+  const nr = /C5GREG:\s*\d+,1/.test(ro) || /CEREG:\s*\d+,1/.test(ro);
+  let sig = '—';
+  const sinr = so.match(/SINR ([0-9.]+) dB/); const rsrp = so.match(/RSRP (-[0-9]+) dB/);
+  if(rsrp) sig = 'RSRP '+rsrp[1]; else if(sinr) sig = 'SINR '+sinr[1]+'dB';
+  let ims = 'IMS ?';
+  if(/IMS registered/.test(io)) ims = 'IMS 已注册';
+  else if(/not registered/.test(io)) ims = 'IMS 未注册';
+  else if(/VoLTE enabled/.test(io)) ims = 'IMS 待注';
+  document.getElementById('radio').innerHTML =
+    chip(0, nr ? 'NR 已注册' : '无服务', nr ? 'ok' : 'bad') +
+    chip(0, '信号 '+sig, nr ? 'ok' : 'dim') +
+    chip(0, ims, /已注册/.test(ims) ? 'ok' : 'bad');
+  document.getElementById('stat-out').textContent =
+    '-- register --\n' + (d.register.output||[]).join('\n') +
+    '\n-- signal --\n' + (d.signal.output||[]).join('\n') +
+    '\n-- ims --\n' + (d.ims.output||[]).join('\n');
+ }catch(e){} }
+function fmtUrc(u){ const o = u.urc;
+  if(o==null) return u.at;
+  if(typeof o==='string') return u.at+'  '+o;
+  const parts=[o.kind||'urc'];
+  for(const k in o){ if(k==='kind') continue;
+    const v=o[k]; if(v===null||v===undefined||v==='') continue;
+    parts.push(k+'='+v); }
+  return u.at+'  '+parts.join(' '); }
+function isRing(u){ const o=u.urc;
+  if(o&&typeof o==='object') return o.kind==='urc-incoming-call';
+  return typeof o==='string' && o.indexOf('+CRING')===0; }
 async function refreshUrc(){ try{ const d = await get('/api/urc'); const us = d.urcs||[];
-  document.getElementById('urc-out').textContent = us.map(function(u){return u.at+'  '+u.urc;}).join('\n');
-  const ring = us.filter(function(u){return u.urc.indexOf('+CRING')===0;});
-  if(ring.length){ const b = document.getElementById('banner');
-    if(b.style.display!=='block'){ b.style.display='block';
-      document.getElementById('bnr-txt').textContent = ring[ring.length-1].urc; } }
-  else { document.getElementById('banner').style.display='none'; }
+  document.getElementById('urc-out').textContent = us.map(fmtUrc).join('\n');
+  const ring = us.filter(isRing);
+  const b = document.getElementById('banner');
+  if(ring.length){ if(b.style.display!=='block'){ b.style.display='block';
+    const o = ring[ring.length-1].urc;
+    document.getElementById('bnr-txt').textContent = (o&&o.kind) ? '来电 '+(o.number||'') : String(o); } }
+  else { b.style.display='none'; }
  }catch(e){} }
 async function refreshMsgs(){ try{ const d = await get('/api/messages'); const ms = d.messages||[];
   document.getElementById('msgs').innerHTML = ms.map(function(m){
@@ -265,14 +304,11 @@ async function dial(){ const r = await post('/api/dial', {number:document.getEle
  out('call-out', r); }
 async function act(w){ const r = await post('/api/'+w, {}); out('call-out', r);
  if(w!=='hangup') setTimeout(function(){document.getElementById('banner').style.display='none';}, 800); }
-async function status(){ const d = await get('/api/status');
- document.getElementById('stat-out').textContent =
-  '-- register --\n' + (d.register.output||[]).join('\n') +
-  '\n-- signal --\n' + (d.signal.output||[]).join('\n') +
-  '\n-- ims --\n' + (d.ims.output||[]).join('\n'); }
 setInterval(refreshState, 5000); setInterval(refreshUrc, 2000); setInterval(refreshMsgs, 8000);
-refreshState(); refreshUrc(); refreshMsgs();
+setInterval(refreshStatus, 20000);
+refreshState(); refreshUrc(); refreshMsgs(); refreshStatus();
 </script></body></html>
+
 "#;
 
 #[cfg(test)]

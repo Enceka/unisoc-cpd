@@ -555,7 +555,7 @@ fn dispatch(
             // probe — keeping the link warm is the daemon's job, not a
             // side-effect of being watched.
             rt.last_activity = Instant::now();
-            run_capability(ctx, log, mark, request)
+            run_capability(ctx, log, &inbox, mark, request)
         }
         "state" => Response {
             ok: true,
@@ -582,7 +582,13 @@ fn dispatch(
     }
 }
 
-fn run_capability(ctx: &mut Context, log: &UrcLog, mark: u64, request: &Request) -> Response {
+fn run_capability(
+    ctx: &mut Context,
+    log: &UrcLog,
+    inbox: &MessageInbox,
+    mark: u64,
+    request: &Request,
+) -> Response {
     let Some(capability) = super::find(&request.capability) else {
         return Response::error(format!(
             "unknown capability {:?}; try `unisoc-cpd capabilities`",
@@ -607,6 +613,28 @@ fn run_capability(ctx: &mut Context, log: &UrcLog, mark: u64, request: &Request)
     // Whatever the network said while we were asking belongs to this run.
     for event in log.since(mark) {
         ctx.event(event.urc.kind(), event.urc.detail());
+    }
+
+    // A power cycle wipes the SMS surface this daemon armed at start
+    // (measured: +CNMI drops back to 0,0,0,1,0 through a cold cycle, and a
+    // +CMTI nobody announces never starts the MT path).  Re-arm after every
+    // passing cfun so the resident owner keeps its ears.
+    if capability.name() == "cfun" && outcome.passed() {
+        let timeout = Duration::from_secs_f64(ctx.profile.at.default_timeout.max(1.0));
+        if let Ok(session) = ctx.at() {
+            let surface = configure_sms_surface(&session, timeout);
+            inbox.text_mode.store(surface.text_mode, Ordering::SeqCst);
+            inbox.charset_gsm.store(surface.charset_gsm, Ordering::SeqCst);
+            inbox
+                .mt_indication
+                .store(surface.mt_indication, Ordering::SeqCst);
+            if !surface.mt_indication {
+                eprintln!(
+                    "unisoc-cpd: +CMTI could not be re-armed after cfun; new \
+                     messages will sit in storage unannounced"
+                );
+            }
+        }
     }
 
     let status = match outcome.status {
