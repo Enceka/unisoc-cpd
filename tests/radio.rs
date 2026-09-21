@@ -29,8 +29,13 @@ struct Rig {
 }
 
 fn rig(name: &str) -> Rig {
+    rig_without(name, &[])
+}
+
+/// The same rig, on a CP that does not have the commands containing `denied`.
+fn rig_without(name: &str, denied: &[&str]) -> Rig {
     let (master, slave) = pty_pair();
-    let _modem = fake_modem(master);
+    let _modem = fake_modem_without(master, denied);
     // Leak the fake modem for the process lifetime: these tests are short and
     // the child needs the pty to stay answered.
     std::mem::forget(_modem);
@@ -133,6 +138,60 @@ fn call_dials_and_hangs_up_signaling_only_without_an_audio_route() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "stdout:\n{stdout}");
     assert!(stdout.contains("ATH"), "stdout:\n{stdout}");
+}
+
+/// The measurement tree is probed, and what it answers is read: this is the
+/// serving cell and the neighbour list the signal panel shows.
+#[test]
+fn serving_and_neighbours_come_out_of_the_measurement_tree() {
+    let r = rig("radio-serving");
+
+    let out = run(&r.dir, "signal", &["serving"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout:\n{stdout}");
+    assert!(stdout.contains("AT+SPENGMD=0,6,0"), "stdout:\n{stdout}");
+    assert!(stdout.contains("AT+SPENGMD=0,14,1"), "stdout:\n{stdout}");
+    assert!(stdout.contains("serving_lte_earfcn: 1650"), "stdout:\n{stdout}");
+    assert!(stdout.contains("serving_lte_rsrp: -85.0"), "stdout:\n{stdout}");
+    assert!(stdout.contains("serving_lte_bandwidth: 20M"), "stdout:\n{stdout}");
+    assert!(stdout.contains("serving_nr_pci: 5"), "stdout:\n{stdout}");
+    assert!(stdout.contains("serving_nr_sinr: -15.0"), "stdout:\n{stdout}");
+
+    let out = run(&r.dir, "signal", &["neighbors"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout:\n{stdout}");
+    assert!(stdout.contains("AT+SPENGMD=0,6,6"), "stdout:\n{stdout}");
+    assert!(stdout.contains("AT+SPENGMD=0,14,2"), "stdout:\n{stdout}");
+    assert!(stdout.contains("neighbors_lte: 2"), "stdout:\n{stdout}");
+    assert!(stdout.contains("neighbors_nr: 2"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("neighbor: NR,band=78,earfcn=627264,pci=5"),
+        "stdout:\n{stdout}"
+    );
+}
+
+/// W5, end to end: a CP that does not have the measurement tree must produce
+/// "not reported" -- never a table with numbers in it.
+#[test]
+fn a_cp_that_refuses_the_measurement_tree_says_not_reported() {
+    let r = rig_without("radio-w5", &["SPENGMD"]);
+
+    let out = run(&r.dir, "signal", &["serving"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "stdout:\n{stdout}");
+    assert!(stdout.contains("serving_lte: not reported"), "stdout:\n{stdout}");
+    assert!(stdout.contains("serving_nr: not reported"), "stdout:\n{stdout}");
+    assert!(
+        !stdout.contains("serving_lte_pci"),
+        "a refused query must not produce a field:\n{stdout}"
+    );
+
+    let out = run(&r.dir, "signal", &["neighbors"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "stdout:\n{stdout}");
+    assert!(stdout.contains("neighbors_lte: not reported"), "stdout:\n{stdout}");
+    assert!(stdout.contains("neighbors_nr: not reported"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("neighbor: LTE"), "stdout:\n{stdout}");
 }
 
 #[test]

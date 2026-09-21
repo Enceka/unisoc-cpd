@@ -122,6 +122,7 @@ fn route(stream: &mut TcpStream, method: &str, path: &str, body: &str, socket: &
             respond_json(stream, &answer);
         }
         ("GET", "/api/info") => respond_json(stream, &api_info(socket)),
+        ("GET", "/api/metrics") => respond_json(stream, &api_metrics(socket)),
         ("GET", "/api/identity") => respond_json(stream, &api_identity(socket)),
         ("GET", "/api/network") => respond_json(stream, &api_network(socket)),
         ("POST", "/api/at") => {
@@ -191,14 +192,125 @@ fn output_lines(answer: &Value) -> Vec<String> {
 /// here for the same reason `decode_cesq` refuses to turn 255 into a number:
 /// "absent" must not be rendered as a value.
 fn summary(output: &[String], key: &str) -> Option<String> {
+    summary_all(output, key).into_iter().next()
+}
+
+/// Every `key: value` line under one key.  The neighbour list repeats its key,
+/// so "all of them" is a shape a panel needs and "the first one" is not.
+fn summary_all(output: &[String], key: &str) -> Vec<String> {
     let prefix = format!("{key}:");
-    output.iter().find_map(|line| {
-        if line.starts_with(' ') || line.starts_with('>') {
+    output
+        .iter()
+        .filter_map(|line| {
+            if line.starts_with(' ') || line.starts_with('>') {
+                return None;
+            }
+            line.strip_prefix(prefix.as_str())
+                .map(|v| v.trim().to_string())
+                // `-` and `not reported` are the capabilities' two ways of
+                // saying "the modem did not tell us", and neither is a value.
+                .filter(|v| !v.is_empty() && v != "-" && v != "not reported")
+        })
+        .collect()
+}
+
+/// `+CSQ: 23,99` -> the RSSI in dBm.  37.003 maps the index as
+/// `-113 + 2*index`, and 99 is "not known", not a very bad signal.
+fn csq_rssi(output: &[String]) -> Option<i32> {
+    let line = output
+        .iter()
+        .find(|l| l.trim_start().starts_with("+CSQ:"))?;
+    let index: i32 = line.split_once(':')?.1.split(',').next()?.trim().parse().ok()?;
+    (index <= 31).then(|| -113 + 2 * index)
+}
+
+/// A value out of the `decoded:` line `signal status` prints, e.g. `RSRP -80
+/// dBm` or `SINR not reported`.  "not reported" is `None` -- `decode_cesq` went
+/// to the trouble of keeping it apart from a reading, and it would be wasted
+/// here.
+fn decoded_field(line: Option<&String>, key: &str) -> Option<String> {
+    let body = line?.split_once("decoded:")?.1;
+    for piece in body.split(", ") {
+        let Some(rest) = piece.trim().strip_prefix(&format!("{key} ")) else {
+            continue;
+        };
+        let value = rest.split_whitespace().next().unwrap_or("");
+        if value.is_empty() || value == "not" {
             return None;
         }
-        line.strip_prefix(prefix.as_str())
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty() && v != "-")
+        return Some(value.to_string());
+    }
+    None
+}
+
+/// One `neighbor: LTE,band=3,earfcn=1650,…` line, as an object.
+fn neighbor_entry(line: &str) -> Value {
+    let mut fields = line.split(',');
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "rat".to_string(),
+        json!(fields.next().unwrap_or_default().trim()),
+    );
+    for field in fields {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        // A band is a label (`78`, `n78`), not an amount: it stays text so a
+        // panel never renders it as `78.0`.
+        let value = match (key, value.parse::<f64>()) {
+            ("band", _) => json!(value),
+            (_, Ok(number)) => json!(number),
+            (_, Err(_)) => json!(value),
+        };
+        map.insert(key.to_string(), value);
+    }
+    Value::Object(map)
+}
+
+fn api_metrics(socket: &Path) -> Value {
+    let status = run_cap(socket, "signal", &[]);
+    let status_out = output_lines(&status);
+    let serving = run_cap(socket, "signal", &["serving"]);
+    let serving_out = output_lines(&serving);
+    let neighbors = run_cap(socket, "signal", &["neighbors"]);
+    let neighbors_out = output_lines(&neighbors);
+
+    let decoded = status_out.iter().find(|l| l.contains("decoded:"));
+    let number = |key: &str| -> Option<f64> {
+        decoded_field(decoded, key).and_then(|v| v.parse::<f64>().ok())
+    };
+    let serving_of = |rat: &str| -> Value {
+        let key = |suffix: &str| summary(&serving_out, &format!("serving_{rat}_{suffix}"));
+        json!({
+            "band": key("band"),
+            "earfcn": key("earfcn").and_then(|v| v.parse::<u32>().ok()),
+            "pci": key("pci").and_then(|v| v.parse::<u32>().ok()),
+            "rsrp_dbm": key("rsrp").and_then(|v| v.parse::<f64>().ok()),
+            "rsrq_db": key("rsrq").and_then(|v| v.parse::<f64>().ok()),
+            "sinr_db": key("sinr").and_then(|v| v.parse::<f64>().ok()),
+            "bandwidth": key("bandwidth"),
+            "cell": key("cell"),
+        })
+    };
+    let lte = serving_of("lte");
+    let nr = serving_of("nr");
+    let unscanned = |value: &Value| value.get("earfcn").map(|v| v.is_null()).unwrap_or(true);
+
+    json!({
+        "rssi_dbm": csq_rssi(&status_out),
+        "rsrp_dbm": number("RSRP"),
+        "rsrq_db": number("RSRQ"),
+        "sinr_db": number("SINR"),
+        "lte": lte,
+        "nr": nr,
+        // "the CP did not report it" and "it reported nothing in range" are
+        // two different facts, and the page must be able to say which.
+        "serving_supported": !unscanned(&lte) || !unscanned(&nr),
+        "neighbors_lte": summary(&neighbors_out, "neighbors_lte").and_then(|v| v.parse::<u32>().ok()),
+        "neighbors_nr": summary(&neighbors_out, "neighbors_nr").and_then(|v| v.parse::<u32>().ok()),
+        "neighbors": summary_all(&neighbors_out, "neighbor").iter().map(|l| neighbor_entry(l)).collect::<Vec<_>>(),
     })
 }
 
@@ -448,6 +560,10 @@ const PAGE: &str = r#"<!doctype html>
 <button onclick="loadIdentity()">刷新</button>
 <div class="kv" id="identity">展开后读取…</div></details>
 
+<details id="d-metrics"><summary>信号详情（RSSI / RSRP / RSRQ / 频率 / 频宽 / PCI / 小区ID · 邻区）</summary>
+<button onclick="loadMetrics()">刷新</button>
+<div class="kv" id="metrics">展开后读取…（要探测测量类 AT，可能较慢）</div></details>
+
 <details id="d-network"><summary>网络（运营商 · 5G SA/NSA · 注册状态）</summary>
 <button onclick="loadNetwork()">刷新</button>
 <div class="kv" id="network">展开后读取…</div></details>
@@ -569,6 +685,29 @@ async function loadIdentity(){
     (d.errors||[]).forEach(function(x){ h += '<div class="err">'+esc(x)+'</div>'; });
     el.innerHTML = h;
   }catch(e){ el.textContent = '读取失败: '+e; } }
+async function loadMetrics(){
+  const el = document.getElementById('metrics');
+  el.textContent = '读取中…（要探测测量类 AT，可能几十秒）';
+  try{ const d = await get('/api/metrics'); let h = '';
+    h += kv('RSSI', d.rssi_dbm!=null ? d.rssi_dbm+' dBm' : null);
+    h += kv('RSRP', d.rsrp_dbm!=null ? d.rsrp_dbm+' dBm' : null);
+    h += kv('RSRQ', d.rsrq_db!=null ? d.rsrq_db+' dB' : null);
+    h += kv('SINR', d.sinr_db!=null ? d.sinr_db+' dB' : null);
+    function cell(tag, s){
+      if(!s || s.earfcn==null) return kv(tag + ' 服务小区', null);
+      return kv(tag + ' 服务小区', 'band ' + (s.band||'—') + ' · EARFCN ' + s.earfcn
+        + ' · PCI ' + (s.pci!=null?s.pci:'—') + ' · 频宽 ' + (s.bandwidth||'—')
+        + ' · 小区ID ' + (s.cell||'—')); }
+    h += cell('LTE', d.lte); h += cell('NR', d.nr);
+    h += kv('邻区 LTE', d.neighbors_lte!=null ? d.neighbors_lte+' 个' : null);
+    h += kv('邻区 NR', d.neighbors_nr!=null ? d.neighbors_nr+' 个' : null);
+    (d.neighbors||[]).forEach(function(n){
+      h += '<div class="hist">' + esc(n.rat + '  band ' + (n.band||'—') + '  EARFCN ' + n.earfcn
+        + '  PCI ' + n.pci + '  RSRP ' + n.rsrp + ' dBm  RSRQ ' + n.rsrq + ' dB'
+        + (n.sinr!=null ? '  SINR ' + n.sinr + ' dB' : '')) + '</div>'; });
+    if(!d.serving_supported) h += '<div class="err">CP 未上报服务小区测量（本代可能不支持 SPENGMD 测量树）</div>';
+    el.innerHTML = h;
+  }catch(e){ el.textContent = '读取失败: '+e; } }
 async function loadNetwork(){
   const el = document.getElementById('network'); el.textContent = '读取中…';
   try{ const d = await get('/api/network'); let h = '';
@@ -581,6 +720,7 @@ async function loadNetwork(){
   }catch(e){ el.textContent = '读取失败: '+e; } }
 function lazyLoad(){
   document.getElementById('d-identity').addEventListener('toggle', function(){ if(this.open) loadIdentity(); });
+  document.getElementById('d-metrics').addEventListener('toggle', function(){ if(this.open) loadMetrics(); });
   document.getElementById('d-network').addEventListener('toggle', function(){ if(this.open) loadNetwork(); });
 }
 
@@ -687,6 +827,53 @@ mod tests {
     fn a_luhn_invalid_imei_is_flagged() {
         let out = lines(&["imei0 (SIM 1, item 5e81) = 490154203237519"]);
         assert_eq!(imei_entries(&out)[0]["luhn"], false);
+    }
+
+    /// 37.003's mapping, and 99 kept as "not known".
+    #[test]
+    fn csq_becomes_dbm_and_99_stays_unknown() {
+        assert_eq!(csq_rssi(&lines(&["+CSQ: 23,99"])), Some(-67));
+        assert_eq!(csq_rssi(&lines(&["+CSQ: 0,99"])), Some(-113));
+        assert_eq!(csq_rssi(&lines(&["+CSQ: 99,99"])), None);
+        assert_eq!(csq_rssi(&lines(&["ERROR"])), None);
+    }
+
+    /// `decode_cesq` works to keep "not reported" apart from a reading; the
+    /// panel must not undo that by parsing it back into a number.
+    #[test]
+    fn decoded_fields_keep_not_reported_apart() {
+        let line = Some("decoded: RSRP -80 dBm, RSRQ -9.5 dB, SINR not reported".to_string());
+        assert_eq!(decoded_field(line.as_ref(), "RSRP").as_deref(), Some("-80"));
+        assert_eq!(decoded_field(line.as_ref(), "RSRQ").as_deref(), Some("-9.5"));
+        assert_eq!(decoded_field(line.as_ref(), "SINR"), None);
+        assert_eq!(decoded_field(None, "RSRP"), None);
+    }
+
+    #[test]
+    fn a_neighbor_line_becomes_numbers_and_text() {
+        let entry = neighbor_entry("LTE,band=3,earfcn=1650,pci=88,rsrp=-95.0,rsrq=-12.0");
+        assert_eq!(entry["rat"], "LTE");
+        assert_eq!(entry["band"], "3", "a band is a label, not arithmetic");
+        assert_eq!(entry["earfcn"], 1650.0);
+        assert_eq!(entry["pci"], 88.0);
+        assert_eq!(entry["rsrp"], -95.0);
+        let nr = neighbor_entry("NR,band=78,earfcn=627264,pci=5,rsrp=-95.0,rsrq=-12.0,sinr=1.0");
+        assert_eq!(nr["sinr"], 1.0);
+    }
+
+    /// The neighbour key repeats, so the panel needs all of them -- and one
+    /// "not reported" line must not be counted as a neighbour.
+    #[test]
+    fn a_repeated_summary_key_yields_every_line() {
+        let out = lines(&[
+            "neighbor: LTE,band=3,earfcn=1650,pci=88,rsrp=-95.0,rsrq=-12.0",
+            "neighbor: NR,band=78,earfcn=627264,pci=5,rsrp=-95.0,rsrq=-12.0",
+            "neighbors_lte: 1",
+            "neighbors_nr: not reported",
+        ]);
+        assert_eq!(summary_all(&out, "neighbor").len(), 2);
+        assert_eq!(summary(&out, "neighbors_lte").as_deref(), Some("1"));
+        assert_eq!(summary(&out, "neighbors_nr"), None);
     }
 
     #[test]

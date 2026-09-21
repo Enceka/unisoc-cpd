@@ -84,6 +84,18 @@ impl Drop for FakeModem {
 
 /// Answer AT commands on `cmd_master`; interleave a URC into every reply.
 pub fn fake_modem(cmd_master: File) -> FakeModem {
+    fake_modem_inner(cmd_master, Vec::new())
+}
+
+/// The same CP, minus the commands it does not have: anything containing one
+/// of `denied` is answered with `ERROR`.  That is how the W5 rule gets a test
+/// -- a CP that refuses the measurement tree must produce "not reported", not
+/// a table of invented numbers.
+pub fn fake_modem_without(cmd_master: File, denied: &[&str]) -> FakeModem {
+    fake_modem_inner(cmd_master, denied.iter().map(|s| s.to_string()).collect())
+}
+
+fn fake_modem_inner(cmd_master: File, denied: Vec<String>) -> FakeModem {
     let stop = Arc::new(AtomicBool::new(false));
     let commands = Arc::new(Mutex::new(Vec::new()));
     let urc_lines = Arc::new(AtomicU64::new(0));
@@ -91,6 +103,7 @@ pub fn fake_modem(cmd_master: File) -> FakeModem {
     let stop_thread = Arc::clone(&stop);
     let cmds = Arc::clone(&commands);
     let urcs = Arc::clone(&urc_lines);
+    let denied = Arc::new(denied);
 
     let mut reader = cmd_master.try_clone().expect("clone master");
     let mut writer = cmd_master;
@@ -133,7 +146,7 @@ pub fn fake_modem(cmd_master: File) -> FakeModem {
                     awaiting_body = true;
                     continue;
                 }
-                respond(&mut writer, &cmd, &urcs, &mut state);
+                respond(&mut writer, &cmd, &urcs, &mut state, &denied);
             }
         }
     });
@@ -180,13 +193,23 @@ struct ModemState {
     volte: u32,
 }
 
-fn respond(w: &mut File, cmd: &str, urcs: &AtomicU64, state: &mut ModemState) {
+fn respond(
+    w: &mut File,
+    cmd: &str,
+    urcs: &AtomicU64,
+    state: &mut ModemState,
+    denied: &[String],
+) {
     // A URC first: a real CP does not wait for the command to finish, and a
     // demultiplexer that reads it as the reply is exactly the bug to catch.
     let _ = w.write_all(b"+CGEV: ME PDN ACT 1\r\n");
     urcs.fetch_add(1, Ordering::SeqCst);
 
     let upper = cmd.to_ascii_uppercase();
+    if denied.iter().any(|d| upper.contains(&d.to_ascii_uppercase())) {
+        let _ = w.write_all(b"ERROR\r\n");
+        return;
+    }
     let body: String = if upper == "AT" {
         "OK\r\n".into()
     } else if upper.starts_with("AT+CGMM") {
@@ -354,8 +377,16 @@ fn respond(w: &mut File, cmd: &str, urcs: &AtomicU64, state: &mut ModemState) {
         "OK\r\n".into()
     } else if upper.starts_with("AT+SP5GCMDS") {
         "+SP5GCMDS: 0,0,1\r\nOK\r\n".into()
-    } else {
-        "ERROR\r\n".into()
+    } else if upper.starts_with("AT+SPENGMD=0,6,0") {
+        // Placeholder measurement, in the shape the parser is built for.
+        "+SPENGMD: 3-1650-88-+8500-+1000-0-0-5-0-0-12345-67890\r\nOK\r\n".into()
+    } else if upper.starts_with("AT+SPENGMD=0,14,1") {
+        "+SPENGMD: 78-627264-5-+9500-+1200-0-0-100-42-4321-0-0-0-0-0-+1500\r\nOK\r\n".into()
+    } else if upper.starts_with("AT+SPENGMD=0,6,6") {
+        "+SPENGMD: 1650,88,+9500,+1200-3000,7,+8800,+900-0,0,0,0\r\nOK\r\n".into()
+    } else if upper.starts_with("AT+SPENGMD=0,14,2") {
+        "+SPENGMD: 78,41-627264,650000-5,6-+9500,+8800-+1200,+900-100,120\r\nOK\r\n".into()
+    } else {        "ERROR\r\n".into()
     };
     let _ = w.write_all(body.as_bytes());
 }

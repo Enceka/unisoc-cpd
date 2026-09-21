@@ -268,6 +268,337 @@ fn dedup(bands: &[u32]) -> Vec<u32> {
     v
 }
 
+// ------------------------------------------------- measurement (`AT+SPENGMD`)
+
+/// `AT+SPENGMD=0,<group>,<index>` — the vendor measurement tree this generation
+/// exposes, as the Android-side helper for it spells the queries.
+pub fn engmd(group: u32, index: u32) -> String {
+    format!("AT+SPENGMD=0,{group},{index}")
+}
+
+/// The LTE serving cell: band, EARFCN, PCI, RSRP/RSRQ, bandwidth, cell id.
+pub const ENGMD_LTE_SERVING: (u32, u32) = (6, 0);
+/// The LTE neighbour list.
+pub const ENGMD_LTE_NEIGHBORS: (u32, u32) = (6, 6);
+/// The NR serving cell.
+pub const ENGMD_NR_SERVING: (u32, u32) = (14, 1);
+/// The NR neighbour list.
+pub const ENGMD_NR_NEIGHBORS: (u32, u32) = (14, 2);
+
+/// One serving cell, as far as the answer could be read.
+///
+/// Every field is an `Option` because the point of this struct is to keep
+/// "the modem did not report it" separable from a value: the W5 rule applied
+/// to a measurement.  A parser that filled in a default here would put an
+/// invented number in front of someone deciding where to point an antenna.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Serving {
+    pub band: Option<String>,
+    pub earfcn: Option<u32>,
+    pub pci: Option<u32>,
+    /// dBm, from a value the CP reports in hundredths.
+    pub rsrp: Option<f64>,
+    /// dB, likewise.
+    pub rsrq: Option<f64>,
+    /// dB, NR only.
+    pub sinr: Option<f64>,
+    /// As reported: an LTE code is decoded to a width, an NR one is verbatim,
+    /// because the NR field's units are not measured here.
+    pub bandwidth: Option<String>,
+    /// The cell identity the answer carried, verbatim.
+    pub cell: Option<String>,
+}
+
+impl Serving {
+    /// Whether the answer carried a cell at all.  EARFCN 0 is how a CP that is
+    /// not camped answers, so a zero is "no cell", not "cell number zero".
+    pub fn is_cell(&self) -> bool {
+        self.earfcn.is_some_and(|e| e > 0)
+    }
+}
+
+/// One neighbour cell.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Neighbor {
+    pub band: Option<String>,
+    pub earfcn: u32,
+    pub pci: u32,
+    pub rsrp: f64,
+    pub rsrq: f64,
+    pub sinr: Option<f64>,
+}
+
+/// The groups of an `AT+SPENGMD` answer.
+///
+/// The shape is the one the Android-side helper for this generation reads: the
+/// first payload line, with the mangled minus signs restored (`,-` -> `,+`,
+/// `--` -> `-+`), split on `-` into groups that are themselves comma lists.
+///
+/// **This is a hypothesis, not a measurement.**  It is the shape the helper's
+/// own indexing implies, and it has not been captured on this handset yet;
+/// that is why every reading below is optional and a shape that does not fit
+/// produces "not reported" rather than a number (W5).
+fn engmd_groups(lines: &[String]) -> Option<Vec<Vec<String>>> {
+    let line = lines
+        .iter()
+        .find(|l| l.to_ascii_uppercase().contains("SPENGMD"))?;
+    let payload = line
+        .split_once(':')
+        .map(|(_, rest)| rest)
+        .unwrap_or(line.as_str());
+    let payload = payload.split("OK").next().unwrap_or(payload);
+    let fixed = payload.replace(",-", ",+").replace("--", "-+");
+    let groups: Vec<Vec<String>> = fixed
+        .split('-')
+        .map(|group| group.split(',').map(|v| v.trim().to_string()).collect())
+        .filter(|group: &Vec<String>| group.first().is_some_and(|v| !v.is_empty()))
+        .collect();
+    if groups.is_empty() {
+        None
+    } else {
+        Some(groups)
+    }
+}
+
+/// One field per group, under whichever of the two shapes the answer is in.
+///
+/// The helper indexes the split as a list of fields, so the answer is either
+/// one group per field (the dash form) or -- when it carries no separator at
+/// all -- one comma list of fields (the flat form).  Those are the only two
+/// readings accepted; anything else is `None`, because a partial index into an
+/// unread shape is exactly how an invented RSRP gets onto a screen.
+fn engmd_view(lines: &[String]) -> Option<Vec<Vec<String>>> {
+    let groups = engmd_groups(lines)?;
+    match groups.len() {
+        // The dash form: the fields we care about are at their own indices.
+        n if n >= 5 => Some(groups),
+        // The flat form: the same indices, into the comma list.
+        1 if groups[0].len() >= 5 => Some(groups[0].iter().map(|v| vec![v.clone()]).collect()),
+        _ => None,
+    }
+}
+
+/// Field `i` of the answer, with the restored sign.  `+` is how the CP's
+/// mangled minus arrives, so it is put back before the number is read.
+fn engmd_field(groups: &[Vec<String>], i: usize) -> Option<String> {
+    groups
+        .get(i)?
+        .first()
+        .map(|v| v.replace('+', "-"))
+        .filter(|v| !v.is_empty())
+}
+
+fn number_i64(value: Option<String>) -> Option<i64> {
+    value?.trim().parse().ok()
+}
+
+/// Hundredths of a unit, which is how this CP reports RSRP/RSRQ/SINR.
+fn hundredths(value: Option<String>) -> Option<f64> {
+    number_i64(value).map(|v| v as f64 / 100.0)
+}
+
+/// An LTE bandwidth code, as 27.007-ish tables number them on this generation.
+fn lte_bandwidth(code: &str) -> Option<String> {
+    Some(
+        match code.trim().parse::<u32>().ok()? {
+            0 => "1.4M",
+            1 => "3M",
+            2 => "5M",
+            3 => "10M",
+            4 => "15M",
+            5 => "20M",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+/// `AT+SPENGMD=0,6,0`: band, EARFCN, PCI, RSRP, RSRQ, …, bandwidth, …, enb, cell.
+///
+/// `None` when the answer does not carry a cell at all -- which is the honest
+/// outcome on a CP that refuses or renumbers this sub-command, and is what the
+/// caller must report instead of a guess.
+pub fn parse_lte_serving(lines: &[String]) -> Option<Serving> {
+    let fields = engmd_view(lines)?;
+    let serving = Serving {
+        band: engmd_field(&fields, 0),
+        earfcn: number_i64(engmd_field(&fields, 1)).and_then(|v| u32::try_from(v).ok()),
+        pci: number_i64(engmd_field(&fields, 2)).and_then(|v| u32::try_from(v).ok()),
+        rsrp: hundredths(engmd_field(&fields, 3)),
+        rsrq: hundredths(engmd_field(&fields, 4)),
+        sinr: None,
+        bandwidth: engmd_field(&fields, 7).and_then(|c| lte_bandwidth(&c)),
+        cell: engmd_field(&fields, 11),
+    };
+    serving.is_cell().then_some(serving)
+}
+
+/// `AT+SPENGMD=0,14,1`: band, EARFCN, PCI, RSRP, RSRQ, …, bandwidth, gNB, cell,
+/// …, SINR.
+pub fn parse_nr_serving(lines: &[String]) -> Option<Serving> {
+    let fields = engmd_view(lines)?;
+    let serving = Serving {
+        band: engmd_field(&fields, 0),
+        earfcn: number_i64(engmd_field(&fields, 1)).and_then(|v| u32::try_from(v).ok()),
+        pci: number_i64(engmd_field(&fields, 2)).and_then(|v| u32::try_from(v).ok()),
+        rsrp: hundredths(engmd_field(&fields, 3)),
+        rsrq: hundredths(engmd_field(&fields, 4)),
+        sinr: hundredths(engmd_field(&fields, 15)),
+        // The NR width field's units are not measured on this generation, so
+        // it is carried verbatim rather than dressed up as a bandwidth.
+        bandwidth: engmd_field(&fields, 7),
+        cell: engmd_field(&fields, 9),
+    };
+    serving.is_cell().then_some(serving)
+}
+
+/// `AT+SPENGMD=0,6,6`: one `earfcn,pci,rsrp,rsrq` record per neighbour, as
+/// groups.  The all-zero record the CP pads the list with is dropped, and so
+/// is any record too short to be a cell.
+pub fn parse_lte_neighbors(lines: &[String]) -> Vec<Neighbor> {
+    let Some(groups) = engmd_groups(lines) else {
+        return Vec::new();
+    };
+    groups
+        .iter()
+        .filter_map(|group| {
+            if group.len() < 4 {
+                return None;
+            }
+            let earfcn = group[0].parse::<u32>().ok()?;
+            let pci = group[1].parse::<u32>().ok()?;
+            let rsrp = hundredths(Some(group[2].replace('+', "-")))?;
+            let rsrq = hundredths(Some(group[3].replace('+', "-")))?;
+            if earfcn == 0 && pci == 0 && rsrp == 0.0 && rsrq == 0.0 {
+                return None;
+            }
+            Some(Neighbor {
+                band: lte_band_from_earfcn(earfcn).map(|b| b.to_string()),
+                earfcn,
+                pci,
+                rsrp,
+                rsrq,
+                sinr: None,
+            })
+        })
+        .collect()
+}
+
+/// `AT+SPENGMD=0,14,2`: the NR neighbour list arrives column-wise — one group
+/// per field, every group a comma list of the same length.
+pub fn parse_nr_neighbors(lines: &[String]) -> Vec<Neighbor> {
+    let Some(groups) = engmd_groups(lines) else {
+        return Vec::new();
+    };
+    let column = |i: usize| -> Vec<String> { groups.get(i).cloned().unwrap_or_default() };
+    let (bands, arfcns, pcis, rsrps, rsrqs, sinrs) = (
+        column(0),
+        column(1),
+        column(2),
+        column(3),
+        column(4),
+        column(5),
+    );
+    let count = [&bands, &arfcns, &pcis, &rsrps, &rsrqs, &sinrs]
+        .iter()
+        .map(|c| c.len())
+        .min()
+        .unwrap_or(0);
+    (0..count)
+        .filter_map(|i| {
+            let earfcn = arfcns[i].parse::<u32>().ok()?;
+            let pci = pcis[i].parse::<u32>().ok()?;
+            let rsrp = hundredths(Some(rsrps[i].replace('+', "-")))?;
+            let rsrq = hundredths(Some(rsrqs[i].replace('+', "-")))?;
+            if earfcn == 0 && pci == 0 && rsrp == 0.0 && rsrq == 0.0 {
+                return None;
+            }
+            Some(Neighbor {
+                band: Some(bands[i].replace('+', "-")).filter(|b| !b.is_empty()),
+                earfcn,
+                pci,
+                rsrp,
+                rsrq,
+                sinr: hundredths(Some(sinrs[i].replace('+', "-"))),
+            })
+        })
+        .collect()
+}
+
+/// The LTE band an EARFCN belongs to, by the 36.101 ranges.  A frequency the
+/// table does not cover is `None`: the neighbour is still reported, its band
+/// is not invented.
+pub fn lte_band_from_earfcn(earfcn: u32) -> Option<u32> {
+    Some(match earfcn {
+        0..=599 => 1,
+        600..=1199 => 2,
+        1200..=1949 => 3,
+        1950..=2399 => 4,
+        2400..=2649 => 5,
+        2650..=2749 => 6,
+        2750..=3449 => 7,
+        3450..=3799 => 8,
+        3800..=4149 => 9,
+        4150..=4749 => 10,
+        4750..=4949 => 11,
+        5010..=5179 => 12,
+        5180..=5279 => 13,
+        5280..=5379 => 14,
+        5730..=5849 => 17,
+        5850..=5999 => 18,
+        6000..=6149 => 19,
+        6150..=6449 => 20,
+        6450..=6599 => 21,
+        6600..=7399 => 22,
+        7500..=7699 => 23,
+        7700..=8039 => 24,
+        8040..=8689 => 25,
+        8690..=9039 => 26,
+        9040..=9209 => 27,
+        9210..=9659 => 28,
+        9660..=9769 => 29,
+        9770..=9869 => 30,
+        9870..=9919 => 31,
+        9920..=10359 => 32,
+        36000..=36199 => 33,
+        36200..=36349 => 34,
+        36350..=36949 => 35,
+        36950..=37549 => 36,
+        37550..=37749 => 37,
+        37750..=38249 => 38,
+        38250..=38649 => 39,
+        38650..=39649 => 40,
+        39650..=41589 => 41,
+        41590..=43589 => 42,
+        43590..=45589 => 43,
+        45590..=46589 => 44,
+        46590..=46789 => 45,
+        46790..=54539 => 46,
+        54540..=55239 => 47,
+        55240..=56739 => 48,
+        56740..=58239 => 49,
+        58240..=59089 => 50,
+        59090..=59139 => 51,
+        59140..=60139 => 52,
+        65536..=66435 => 65,
+        66436..=67335 => 66,
+        67336..=67535 => 67,
+        67536..=67835 => 68,
+        67836..=68335 => 69,
+        68336..=68585 => 70,
+        68586..=68935 => 71,
+        68936..=68985 => 72,
+        68986..=69035 => 73,
+        69036..=69465 => 74,
+        69466..=70315 => 75,
+        70316..=70365 => 76,
+        70366..=70545 => 85,
+        70546..=70595 => 87,
+        70596..=70645 => 88,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,5 +685,145 @@ mod tests {
         assert_eq!(parse_ims_reg("+CIREG: 0,0"), Some(0));
         // a one-field answer carries no state to read
         assert_eq!(parse_ims_reg("+CIREG: 0"), None);
+    }
+}
+
+/// The `AT+SPENGMD` readings.
+///
+/// These tests pin the *hypothesis* the parser is built on -- the reading the
+/// Android-side helper for this generation implies -- and not a measurement on
+/// this handset: no answer from this CP has been captured yet, which is why
+/// every one of these functions is allowed to return "nothing read".  The
+/// samples below are constructed to that hypothesis, with placeholder values.
+#[cfg(test)]
+mod engmd_tests {
+    use super::*;
+
+    fn lines(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn serving_reads_the_dash_form() {
+        // one field per group
+        let answer = lines(&["+SPENGMD: 3-1650-88-+8500-+1000-0-0-5-0-0-12345-67890"]);
+        let s = parse_lte_serving(&answer).expect("a cell");
+        assert_eq!(s.band.as_deref(), Some("3"));
+        assert_eq!(s.earfcn, Some(1650));
+        assert_eq!(s.pci, Some(88));
+        assert_eq!(s.rsrp, Some(-85.0));
+        assert_eq!(s.rsrq, Some(-10.0));
+        assert_eq!(s.bandwidth.as_deref(), Some("20M"));
+        assert_eq!(s.cell.as_deref(), Some("67890"));
+        assert_eq!(s.sinr, None, "LTE serving has no SINR field here");
+    }
+
+    #[test]
+    fn serving_reads_the_flat_form() {
+        // the same fields as one comma list, which is the other shape the
+        // helper's indexing implies
+        let answer = lines(&["+SPENGMD: 3,1650,88,+8500,+1000,0,0,5,0,0,12345,67890", "OK"]);
+        let s = parse_lte_serving(&answer).expect("a cell");
+        assert_eq!(s.band.as_deref(), Some("3"));
+        assert_eq!(s.earfcn, Some(1650));
+        assert_eq!(s.pci, Some(88));
+        assert_eq!(s.rsrp, Some(-85.0));
+        assert_eq!(s.rsrq, Some(-10.0));
+        assert_eq!(s.bandwidth.as_deref(), Some("20M"));
+    }
+
+    #[test]
+    fn nr_serving_reads_its_own_field_positions() {
+        let mut fields = vec!["78"; 16];
+        fields[1] = "627264";
+        fields[2] = "5";
+        fields[3] = "+9500";
+        fields[4] = "+1200";
+        fields[7] = "100";
+        fields[9] = "4321";
+        fields[15] = "+1500";
+        let answer = lines(&[&format!("+SPENGMD: {}", fields.join("-"))]);
+        let s = parse_nr_serving(&answer).expect("a cell");
+        assert_eq!(s.band.as_deref(), Some("78"));
+        assert_eq!(s.earfcn, Some(627264));
+        assert_eq!(s.pci, Some(5));
+        assert_eq!(s.rsrp, Some(-95.0));
+        assert_eq!(s.rsrq, Some(-12.0));
+        assert_eq!(s.sinr, Some(-15.0));
+        assert_eq!(s.bandwidth.as_deref(), Some("100"));
+        assert_eq!(s.cell.as_deref(), Some("4321"));
+    }
+
+    /// The one that matters: an answer this build cannot read must read as
+    /// nothing, not as a cell at zero.
+    #[test]
+    fn an_unreadable_answer_reads_as_nothing() {
+        assert_eq!(parse_lte_serving(&lines(&["ERROR"])), None);
+        assert_eq!(parse_lte_serving(&lines(&["+SPENGMD: 0,0"])), None);
+        assert_eq!(parse_lte_serving(&lines(&["+SPENGMD: 0-0-0-0-0"])), None);
+        assert_eq!(parse_lte_serving(&lines(&[])), None);
+        assert_eq!(parse_nr_serving(&lines(&["ERROR"])), None);
+        // and a serving cell with EARFCN 0 is "not camped", not "band 1"
+        assert_eq!(parse_lte_serving(&lines(&["+SPENGMD: 1,0,88,+8500,+1000"])), None);
+    }
+
+    #[test]
+    fn lte_neighbours_are_one_record_per_group() {
+        let answer = lines(&[
+            "+SPENGMD: 1650,88,+9500,+1200-3000,7,+8800,+900-0,0,0,0",
+            "OK",
+        ]);
+        let cells = parse_lte_neighbors(&answer);
+        assert_eq!(cells.len(), 2, "the all-zero padding record is not a cell");
+        assert_eq!(cells[0].band.as_deref(), Some("3"), "EARFCN 1650 is band 3");
+        assert_eq!((cells[0].earfcn, cells[0].pci), (1650, 88));
+        assert_eq!(cells[0].rsrp, -95.0);
+        assert_eq!(cells[0].rsrq, -12.0);
+        assert_eq!(cells[1].band.as_deref(), Some("7"), "EARFCN 3000 is band 7");
+        assert_eq!((cells[1].earfcn, cells[1].pci), (3000, 7));
+    }
+
+    #[test]
+    fn nr_neighbours_arrive_column_wise() {
+        let answer = lines(&[
+            "+SPENGMD: 78,41-627264,650000-5,6-+9500,+8800-+1200,+900-100,120",
+        ]);
+        let cells = parse_nr_neighbors(&answer);
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].band.as_deref(), Some("78"));
+        assert_eq!((cells[0].earfcn, cells[0].pci), (627264, 5));
+        assert_eq!((cells[0].rsrp, cells[0].rsrq), (-95.0, -12.0));
+        assert_eq!(cells[0].sinr, Some(1.0));
+        assert_eq!(cells[1].band.as_deref(), Some("41"));
+        assert_eq!((cells[1].earfcn, cells[1].pci), (650000, 6));
+    }
+
+    #[test]
+    fn no_neighbour_answer_is_an_empty_list() {
+        assert!(parse_lte_neighbors(&lines(&["ERROR"])).is_empty());
+        assert!(parse_nr_neighbors(&lines(&["+SPENGMD: 0-0-0-0-0-0"])).is_empty());
+    }
+
+    #[test]
+    fn earfcn_maps_to_a_band_where_the_table_covers_it() {
+        assert_eq!(lte_band_from_earfcn(1650), Some(3));
+        assert_eq!(lte_band_from_earfcn(3000), Some(7));
+        assert_eq!(lte_band_from_earfcn(38675), Some(40));
+        // outside every documented range: reported as unknown, not guessed
+        assert_eq!(lte_band_from_earfcn(999_999), None);
+    }
+
+    #[test]
+    fn the_probe_commands_are_the_ones_the_helper_uses() {
+        assert_eq!(engmd(ENGMD_LTE_SERVING.0, ENGMD_LTE_SERVING.1), "AT+SPENGMD=0,6,0");
+        assert_eq!(
+            engmd(ENGMD_LTE_NEIGHBORS.0, ENGMD_LTE_NEIGHBORS.1),
+            "AT+SPENGMD=0,6,6"
+        );
+        assert_eq!(engmd(ENGMD_NR_SERVING.0, ENGMD_NR_SERVING.1), "AT+SPENGMD=0,14,1");
+        assert_eq!(
+            engmd(ENGMD_NR_NEIGHBORS.0, ENGMD_NR_NEIGHBORS.1),
+            "AT+SPENGMD=0,14,2"
+        );
     }
 }

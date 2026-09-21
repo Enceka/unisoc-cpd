@@ -109,6 +109,7 @@ fn web_serves_the_page_and_the_daemons_state() {
     let mut info_ok = false;
     let mut identity_ok = false;
     let mut network_ok = false;
+    let mut metrics_ok = false;
     for _ in 0..50 {
         std::thread::sleep(Duration::from_millis(200));
         if let Some(body) = http_try(port, "/") {
@@ -146,7 +147,17 @@ fn web_serves_the_page_and_the_daemons_state() {
                 network_ok |= body.contains("46001") && body.contains("5G SA");
             }
         }
-        if page_ok && state_ok && dial_ok && at_ok && info_ok && identity_ok && network_ok {
+        if !metrics_ok {
+            if let Some(body) = http_try(port, "/api/metrics") {
+                // The serving cell and one neighbour, out of the (placeholder)
+                // measurement the fake CP answers.
+                metrics_ok |= body.contains("\"earfcn\":1650")
+                    && body.contains("-85.0")
+                    && body.contains("627264");
+            }
+        }
+        if page_ok && state_ok && dial_ok && at_ok && info_ok && identity_ok && network_ok && metrics_ok
+        {
             break;
         }
     }
@@ -160,4 +171,5 @@ fn web_serves_the_page_and_the_daemons_state() {
     assert!(info_ok, "/api/info did not report the CP identity");
     assert!(identity_ok, "/api/identity did not report ICCID/phone/IMSI");
     assert!(network_ok, "/api/network did not report the operator and the RAT");
+    assert!(metrics_ok, "/api/metrics did not report the serving cell and neighbours");
 }

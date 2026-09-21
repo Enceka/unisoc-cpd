@@ -345,10 +345,21 @@ impl Capability for Signal {
     }
 
     fn summary(&self) -> &'static str {
-        "signal quality (AT+CSQ, AT+CESQ with RSRP/RSRQ decoded)"
+        "signal quality (AT+CSQ, AT+CESQ decoded), plus `serving` and `neighbors` measurements"
     }
 
-    fn run(&self, ctx: &mut Context, _args: &[String]) -> Result<Outcome> {
+    fn run(&self, ctx: &mut Context, args: &[String]) -> Result<Outcome> {
+        match positionals(args).first().map(|s| s.as_str()) {
+            // The measurement tree, probed under W5: what the CP answers is
+            // reported, and a sub-command it refuses is reported as unsupported
+            // rather than filled in from the serving cell.
+            Some("serving") => return signal_serving(ctx),
+            Some("neighbors") => return signal_neighbors(ctx),
+            None | Some("status") => {}
+            Some(other) => anyhow::bail!(
+                "signal: unknown action {other:?} (status|serving|neighbors)"
+            ),
+        }
         let session = ctx.at()?;
         let t = Duration::from_secs(8);
         let mut out = Vec::new();
@@ -401,6 +412,158 @@ pub fn decode_cesq(line: &str) -> Option<(Option<i32>, Option<f64>, Option<f64>)
     let rsrq = reported(rsrq_idx).map(|idx| -19.5 + idx as f64 * 0.5);
     let sinr = idx(8).and_then(reported).map(|v| (v as f64 - 20.0) / 2.0);
     Some((rsrp, rsrq, sinr))
+}
+
+// ---------------------------------------------- the measurement tree (W5)
+
+/// One field of a serving-cell summary line: a number, or "not reported".
+fn shown(value: Option<f64>) -> String {
+    value.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".to_string())
+}
+
+fn shown_text(value: &Option<String>) -> String {
+    value.clone().unwrap_or_else(|| "-".to_string())
+}
+
+fn shown_int(value: Option<u32>) -> String {
+    value.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string())
+}
+
+fn serving_summary(rat: &str, s: &crate::unisoc_at::Serving) -> Vec<String> {
+    vec![
+        format!("serving_{rat}_band: {}", shown_text(&s.band)),
+        format!("serving_{rat}_earfcn: {}", shown_int(s.earfcn)),
+        format!("serving_{rat}_pci: {}", shown_int(s.pci)),
+        format!("serving_{rat}_rsrp: {}", shown(s.rsrp)),
+        format!("serving_{rat}_rsrq: {}", shown(s.rsrq)),
+        format!("serving_{rat}_sinr: {}", shown(s.sinr)),
+        format!("serving_{rat}_bandwidth: {}", shown_text(&s.bandwidth)),
+        format!("serving_{rat}_cell: {}", shown_text(&s.cell)),
+    ]
+}
+
+/// The serving cell, out of the generation's own measurement sub-commands.
+///
+/// These commands are the ones the Android-side helper for this CP generation
+/// asks; their *answers* have not been captured on this handset yet, so the
+/// parser is allowed to come back empty and this action then reports `not
+/// reported`.  That is the W5 rule: a sub-command the CP does not answer
+/// leaves a gap in the table, never a plausible-looking number.
+fn signal_serving(ctx: &mut Context) -> Result<Outcome> {
+    let session = ctx.at()?;
+    let t = Duration::from_secs(6);
+    let mut out = Vec::new();
+    let mut measured = false;
+
+    let queries: [(&str, (u32, u32), fn(&[String]) -> Option<crate::unisoc_at::Serving>); 2] = [
+        (
+            "lte",
+            crate::unisoc_at::ENGMD_LTE_SERVING,
+            crate::unisoc_at::parse_lte_serving,
+        ),
+        (
+            "nr",
+            crate::unisoc_at::ENGMD_NR_SERVING,
+            crate::unisoc_at::parse_nr_serving,
+        ),
+    ];
+
+    for (rat, (group, index), parse) in queries {
+        let cmd = crate::unisoc_at::engmd(group, index);
+        let reply = session.command(&cmd, t, &[], 0);
+        emit(&mut out, &cmd, &reply);
+        match parse(&reply.lines) {
+            Some(serving) => {
+                measured = true;
+                out.push(format!(
+                    "  -> {:<3} band {}, PCI {}, EARFCN {}, RSRP {} dBm, RSRQ {} dB",
+                    rat.to_uppercase(),
+                    shown_text(&serving.band),
+                    shown_int(serving.pci),
+                    shown_int(serving.earfcn),
+                    shown(serving.rsrp),
+                    shown(serving.rsrq),
+                ));
+                out.extend(serving_summary(rat, &serving));
+            }
+            None => out.push(format!("serving_{rat}: not reported")),
+        }
+    }
+
+    if !measured {
+        ctx.note(
+            "the CP does not answer the SPENGMD serving queries: no measurement to report"
+                .to_string(),
+        );
+    }
+    Ok(if measured {
+        Outcome::pass(out)
+    } else {
+        Outcome::fail(out)
+    })
+}
+
+/// The neighbour list, probed the same way as the serving cell.
+///
+/// `not reported` and `0` are kept apart on purpose: the first says the CP
+/// refuses the query (or does not have it), the second says it answered and
+/// there is nothing in range.  A UI that showed both as "0 neighbours" would
+/// be claiming a measurement that was never made.
+fn signal_neighbors(ctx: &mut Context) -> Result<Outcome> {
+    let session = ctx.at()?;
+    let t = Duration::from_secs(8);
+    let mut out = Vec::new();
+
+    let mut ask = |out: &mut Vec<String>, group: u32, index: u32| -> crate::at::Reply {
+        let cmd = crate::unisoc_at::engmd(group, index);
+        let reply = session.command(&cmd, t, &[], 0);
+        emit(out, &cmd, &reply);
+        reply
+    };
+    let lte = ask(&mut out, crate::unisoc_at::ENGMD_LTE_NEIGHBORS.0, crate::unisoc_at::ENGMD_LTE_NEIGHBORS.1);
+    let nr = ask(&mut out, crate::unisoc_at::ENGMD_NR_NEIGHBORS.0, crate::unisoc_at::ENGMD_NR_NEIGHBORS.1);
+
+    let lte_cells = crate::unisoc_at::parse_lte_neighbors(&lte.lines);
+    let nr_cells = crate::unisoc_at::parse_nr_neighbors(&nr.lines);
+
+    for (rat, cells, answered) in [("LTE", &lte_cells, lte.ok()), ("NR", &nr_cells, nr.ok())] {
+        for cell in cells {
+            out.push(format!(
+                "neighbor: {rat},band={},earfcn={},pci={},rsrp={:.1},rsrq={:.1}{}",
+                shown_text(&cell.band),
+                cell.earfcn,
+                cell.pci,
+                cell.rsrp,
+                cell.rsrq,
+                cell.sinr
+                    .map(|s| format!(",sinr={s:.1}"))
+                    .unwrap_or_default()
+            ));
+        }
+        out.push(format!(
+            "neighbors_{}: {}",
+            rat.to_ascii_lowercase(),
+            if answered {
+                cells.len().to_string()
+            } else {
+                "not reported".to_string()
+            }
+        ));
+    }
+
+    let answered = lte.ok() || nr.ok();
+    if !answered {
+        ctx.note(
+            "the CP does not answer the SPENGMD neighbour queries: it does not report \
+             neighbours (or not in a shape this build knows)"
+                .to_string(),
+        );
+    }
+    Ok(if answered {
+        Outcome::pass(out)
+    } else {
+        Outcome::fail(out)
+    })
 }
 
 // ------------------------------------------------------------------ operator
