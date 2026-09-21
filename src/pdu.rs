@@ -131,8 +131,8 @@ mod tests {
             [0x31, 0x00, 0x00, 0x00, 0x00, 0xF0]
         );
         assert_eq!(
-            semioctet_bytes("<smsc>"),
-            [0x68, 0x91, 0x02, 0x77, 0x00, 0x05]
+            semioctet_bytes("8613800755500"),
+            [0x68, 0x31, 0x08, 0x70, 0x55, 0x05, 0xF0]
         );
     }
 
@@ -164,9 +164,10 @@ mod tests {
 
     #[test]
     fn an_smsc_is_carried_when_named() {
-        // <smsc> -> length 7, TOA 0x91, semi-octets 68 91 02 77 00 05.
-        let (hex, octets) = encode_submit(Some("<smsc>"), "1234", "a").unwrap();
-        assert!(hex.starts_with("0791689102770005"), "{hex}");
+        // +8613800755500 -> length 8 (TOA + 7 semi-octet bytes), TOA 0x91,
+        // semi-octets 68 31 08 70 55 05 F0.
+        let (hex, octets) = encode_submit(Some("+8613800755500"), "1234", "a").unwrap();
+        assert!(hex.starts_with("0891683108705505F0"), "{hex}");
         // TPDU: MTI, MR, a 4-byte address field, PID, DCS, UDL, 2 bytes of UD.
         assert_eq!(octets, 11);
     }

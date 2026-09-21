@@ -308,7 +308,7 @@ a mixer/route problem (tinyalsa-class), not a signaling one.
 
 The SMS surface needed re-learning this session: the RIL had parked the
 teach-in charset at `HEX` again (the SMSC read back as hex-of-ASCII,
-`+CSCS="GSM"` first, then re-arm — `<smsc>` here), and a cold
+`+CSCS="GSM"` first, then re-arm with the SMSC the SIM reports), and a cold
 cycle wipes the `+CNMI` MT indication armed at start (measured:
 `0,0,0,1,0` after `cfun cold`), so serve now re-arms the surface after
 every passing cfun.  With both fixed, an MO loopback submit delivered and

@@ -198,7 +198,7 @@ fn respond(w: &mut File, cmd: &str, urcs: &AtomicU64, state: &mut ModemState) {
     } else if upper.starts_with("AT+CIMI") {
         "460011234567890\r\nOK\r\n".into()
     } else if upper.starts_with("AT+CCID") {
-        "+CCID: <iccid>\r\nOK\r\n".into()
+        "+CCID: 8986012345678901234\r\nOK\r\n".into()
     } else if upper.starts_with("AT+CEREG?") {
         "+CEREG: 2,1,\"DE0400\",\"005BE001\",11\r\nOK\r\n".into()
     } else if upper.starts_with("AT+CGREG?") || upper.starts_with("AT+CREG?") {
