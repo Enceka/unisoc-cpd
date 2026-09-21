@@ -720,6 +720,9 @@ fn api_identity(socket: &Path) -> Value {
         "phone": summary(&sim_out, "phone"),
         "imei": imei_entries(&output_lines(&imei)),
         "ip": summary(&data_out, "ip"),
+        "ip6": summary(&data_out, "ip6"),
+        "ip6_dns": summary(&data_out, "ip6_dns"),
+        "ip6_interface": summary(&data_out, "ip6_interface"),
         "apn": summary(&data_out, "apn"),
         "dns": summary(&data_out, "dns"),
         "smsc": summary(&sms_out, "smsc"),
@@ -833,136 +836,332 @@ fn percent_decode(s: &str) -> String {
 // ----------------------------------------------------------------- the page
 
 const PAGE: &str = r#"<!doctype html>
+<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content='#FFFBFE'>
 <title>unisoc-cpd</title>
 <style>
- body{font-family:system-ui,sans-serif;background:#111;color:#ddd;margin:0;padding:12px}
- h1{font-size:18px} h2{font-size:15px;margin:14px 0 6px}
- .chips span{display:inline-block;background:#1d2b1d;border:1px solid #2e4d2e;border-radius:10px;padding:2px 10px;margin:2px;font-size:12px}
- .chips span.ok{background:#163416;border-color:#3f7f3f;color:#b8e6b8}
- .chips span.bad{background:#3d1515;border-color:#8f3f3f;color:#f0b8b8}
- .chips span.dim{opacity:.55}
- pre{background:#181818;border:1px solid #333;border-radius:6px;padding:8px;min-height:14px;max-height:220px;overflow:auto;font-size:12px;white-space:pre-wrap}
- input,button{font-size:14px;border-radius:6px;border:1px solid #444;background:#222;color:#eee;padding:6px 10px;margin:2px}
- button{cursor:pointer;background:#28422a} button.red{background:#5a2323}
- #banner{display:none;position:fixed;inset:0;background:rgba(120,20,20,.94);z-index:9;text-align:center;padding-top:30vh}
- #banner button{font-size:22px;margin:12px}
- .msg{border-bottom:1px solid #2a2a2a;padding:6px 2px;font-size:13px}
- .from{color:#8bc78b}
- .warn{background:#3a2a12;border:1px solid #8a6420;color:#f0d9a8;border-radius:6px;padding:8px;font-size:12px;margin:6px 0}
- details{border:1px solid #333;border-radius:6px;margin:8px 0;padding:6px 8px;background:#161616}
- summary{cursor:pointer;font-weight:600;font-size:14px}
- .kv{font-size:13px;line-height:1.7} .kv b{color:#9cc79c;font-weight:600;display:inline-block;min-width:74px}
- .kv .dim{opacity:.55}
- .err{color:#f0b8b8;font-size:12px}
- .hist{font-size:12px;color:#888;cursor:pointer}
- .hist:hover{color:#ddd}
+/* Material You (MD3), light.  No external font or stylesheet: this page is
+   served out of the daemon's own memory and read on a handset that may have no
+   data path at all -- which is exactly when it is needed.  Roboto is the
+   design's typeface and is present on Android; the CJK faces behind it are what
+   the interface actually renders in. */
+:root{
+  --p:#6750A4; --on-p:#FFFFFF; --p-c:#EADDFF; --on-p-c:#21005D;
+  --s-c:#E8DEF8; --on-s-c:#1D192B;
+  --t-c:#FFD8E4; --on-t-c:#31111D;
+  --err:#B3261E; --on-err:#FFFFFF; --err-c:#F9DEDC; --on-err-c:#410E0B;
+  --bg:#FFFBFE; --surf:#FFFBFE; --sc:#F3EDF7; --sc-low:#E7E0EC;
+  --on:#1C1B1F; --on-v:#49454F; --out:#79747E; --out-v:#CAC4D0;
+  --ok-c:#D7F3DE; --ok-f:#0B5227; --warn-c:#FFE8C2; --warn-f:#6B4200;
+  --e1:0 1px 2px rgba(28,27,31,.10),0 1px 3px rgba(28,27,31,.06);
+  --e2:0 2px 6px rgba(28,27,31,.13),0 1px 3px rgba(28,27,31,.08);
+  --e3:0 10px 24px rgba(28,27,31,.16),0 2px 6px rgba(28,27,31,.08);
+  --r-s:12px; --r-m:16px; --r-l:24px; --r-xl:28px; --full:9999px;
+  --ease:cubic-bezier(.2,0,0,1);
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--on);line-height:1.5;
+  font-family:Roboto,"Roboto Flex","Noto Sans SC","Noto Sans CJK SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  padding-bottom:44px}
+
+/* Signature MD3 atmosphere: organic blurred shapes behind the content, never
+   in front of it, and never the only thing carrying meaning. */
+.aura{position:fixed;inset:0;overflow:hidden;pointer-events:none;z-index:0}
+.aura i{position:absolute;display:block;border-radius:50%;filter:blur(64px);opacity:.55}
+.aura i:nth-child(1){width:300px;height:300px;background:var(--p-c);top:-110px;right:-80px}
+.aura i:nth-child(2){width:260px;height:260px;background:var(--t-c);top:150px;left:-110px}
+.aura i:nth-child(3){width:220px;height:220px;background:var(--s-c);bottom:-70px;right:-30px}
+
+.appbar{position:sticky;top:0;z-index:5;padding:10px 16px 12px;
+  background:rgba(255,251,254,.86);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  border-bottom:1px solid var(--out-v)}
+/* The bar is full-bleed, its contents are not: on a wide window the title has
+   to line up with the cards below it, not with the edge of the screen. */
+.appbar>.bar{max-width:760px;margin:0 auto}
+.appbar h1{margin:0;font-size:1.375rem;font-weight:500;letter-spacing:0}
+.hero{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:8px 0 6px;font-size:.8125rem;color:var(--on-v)}
+.hero b{font-weight:500;color:var(--on)}
+.hero em{font-style:normal;background:var(--s-c);color:var(--on-s-c);border-radius:var(--full);padding:2px 10px;font-size:.75rem}
+
+.wrap{position:relative;z-index:1;max-width:760px;margin:0 auto;padding:0 16px}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.chip{display:inline-flex;align-items:center;background:var(--s-c);color:var(--on-s-c);
+  border-radius:var(--full);padding:5px 12px;font-size:.75rem;font-weight:500;letter-spacing:.01em;
+  transition:background-color .2s var(--ease),box-shadow .3s var(--ease)}
+.chip.ok{background:var(--ok-c);color:var(--ok-f)}
+.chip.bad{background:var(--err-c);color:var(--on-err-c)}
+.chip.warn{background:var(--warn-c);color:var(--warn-f)}
+.chip.dim{background:var(--sc-low);color:var(--on-v)}
+
+.card{background:var(--sc);border-radius:var(--r-l);padding:4px 16px 16px;margin:14px 0;
+  box-shadow:var(--e1);transition:box-shadow .3s var(--ease)}
+.card:hover{box-shadow:var(--e2)}
+.card[open]{box-shadow:var(--e2)}
+.card>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:10px;
+  padding:15px 0;font-size:.9375rem;font-weight:500;color:var(--on)}
+.card>summary::-webkit-details-marker{display:none}
+.card>summary:focus-visible{outline:2px solid var(--p);outline-offset:4px;border-radius:var(--full)}
+.chev{margin-left:auto;width:9px;height:9px;flex:0 0 auto;border-right:2px solid var(--on-v);
+  border-bottom:2px solid var(--on-v);transform:rotate(45deg) translate(-2px,-2px);
+  transition:transform .3s var(--ease)}
+.card[open] .chev{transform:rotate(-135deg) translate(-2px,-2px)}
+.sub{font-size:.6875rem;font-weight:400;color:var(--on-v);
+  font-family:"Roboto Mono",ui-monospace,SFMono-Regular,Menlo,monospace}
+h2{margin:18px 0 4px;font-size:1rem;font-weight:500}
+.card h2:first-child{margin-top:18px}
+
+.row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:10px 0}
+.row.tight{gap:6px;margin:6px 0}
+
+.btn{appearance:none;border:0;cursor:pointer;font:inherit;font-size:.875rem;font-weight:500;
+  letter-spacing:.01em;height:40px;padding:0 22px;border-radius:var(--full);
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  background:var(--p);color:var(--on-p);
+  transition:box-shadow .3s var(--ease),background-color .2s var(--ease),transform .12s var(--ease)}
+.btn:hover{box-shadow:var(--e1);background-image:linear-gradient(rgba(255,255,255,.14),rgba(255,255,255,.14))}
+.btn:active{transform:scale(.95)}
+.btn:focus-visible{outline:2px solid var(--p);outline-offset:2px}
+.btn.tonal{background:var(--s-c);color:var(--on-s-c)}
+.btn.tonal:hover{background-image:linear-gradient(rgba(29,25,43,.10),rgba(29,25,43,.10))}
+.btn.out{background:transparent;color:var(--p);box-shadow:inset 0 0 0 1px var(--out)}
+.btn.out:hover{background-color:rgba(103,80,164,.08);
+  background-image:none;box-shadow:inset 0 0 0 1px var(--out)}
+.btn.text{background:transparent;color:var(--p);padding:0 14px}
+.btn.text:hover{background-color:rgba(103,80,164,.10);background-image:none;box-shadow:none}
+.btn.red{background:var(--err);color:var(--on-err)}
+.btn.sm{height:32px;padding:0 14px;font-size:.75rem}
+
+input:not([type=checkbox]),select{font:inherit;font-size:.875rem;height:48px;padding:0 14px;
+  border:0;border-bottom:2px solid var(--out);border-radius:var(--r-s) var(--r-s) 0 0;
+  background:var(--sc-low);color:var(--on);
+  transition:border-color .2s var(--ease),background-color .2s var(--ease)}
+/* Width comes from the row, not from `size`: the UA sizes a field by its
+   average character, and the CJK fallback behind this interface makes that
+   average twice as wide as it looks, so `size="16"` was taking two thirds of
+   the screen. */
+.row>input:not([type=checkbox]){flex:1 1 7rem;min-width:5rem}
+.row>select{flex:0 0 auto;min-width:76px}
+.tag{flex:0 0 auto;font-size:.75rem;color:var(--on-v)}
+/* A number field holds one number, not a paragraph: it must not claim the row
+   and push the rest of it off the card.  The element is named in the selector
+   because `.row>input:not(...)` is otherwise the more specific rule, and a
+   losing rule is a rule that does nothing. */
+.row>input.w-num,.row>select.w-num{flex:0 1 6.5rem;min-width:4.5rem}
+/* A label and the field it names wrap together or not at all: a line break
+   between them reads as a label for whatever comes next. */
+.pair{display:inline-flex;align-items:center;gap:6px;flex:0 0 auto}
+.pair>input,.pair>select{flex:0 0 auto;width:6rem}
+input:not([type=checkbox]):focus,select:focus{outline:none;border-bottom-color:var(--p);background:#EFE7F3}
+input::placeholder{color:var(--on-v);opacity:.7}
+input[type=checkbox]{width:18px;height:18px;accent-color:var(--p);vertical-align:-3px}
+label{display:inline-flex;align-items:center;gap:6px;font-size:.8125rem;color:var(--on-v);margin:2px 0}
+
+.kv{font-size:.8125rem;line-height:1.7;color:var(--on);margin:6px 0}
+.kv>div{display:flex;gap:10px;padding:4px 0;border-bottom:1px solid rgba(121,116,126,.14)}
+.kv>div:last-child{border-bottom:0}
+.kv b{flex:0 0 auto;min-width:98px;font-weight:500;color:var(--on-v)}
+.kv .dim{color:var(--on-v);opacity:.65}
+.err{color:var(--err);font-size:.75rem;padding:2px 0}
+.warn{background:var(--warn-c);color:var(--warn-f);border-radius:var(--r-m);
+  padding:12px 14px;margin:10px 0;font-size:.75rem;line-height:1.65}
+.warn code{background:rgba(107,66,0,.14);border-radius:4px;padding:0 4px}
+code{font-family:"Roboto Mono",ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.75rem}
+.note{font-size:.6875rem;line-height:1.6;color:var(--on-v);margin:8px 0}
+
+pre{background:#EDE6F4;color:var(--on);border-radius:var(--r-s);padding:12px;margin:10px 0;
+  font-family:"Roboto Mono",ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.75rem;line-height:1.55;
+  min-height:18px;max-height:280px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+
+.msg{background:var(--surf);border-radius:var(--r-m);padding:12px 14px;margin:8px 0;
+  font-size:.8125rem;line-height:1.55;box-shadow:var(--e1);
+  transition:box-shadow .3s var(--ease)}
+.msg:hover{box-shadow:var(--e2)}
+.msg .from{font-size:.875rem;font-weight:500;color:var(--p)}
+.msg .meta{font-size:.6875rem;color:var(--on-v);margin-left:6px}
+.msg .body{margin-top:6px;white-space:pre-wrap;word-break:break-word}
+.msg .row{justify-content:flex-end;margin:8px 0 0}
+
+.hist-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:6px 0}
+.hist{display:inline-flex;align-items:center;border:0;background:var(--sc-low);color:var(--on-v);
+  border-radius:var(--full);padding:5px 11px;font-size:.6875rem;
+  font-family:"Roboto Mono",ui-monospace,Menlo,monospace;cursor:pointer;
+  transition:background-color .2s var(--ease),color .2s var(--ease),transform .12s var(--ease)}
+.hist:hover{background:var(--p-c);color:var(--on-p-c)}
+.hist:active{transform:scale(.95)}
+.hist:focus-visible{outline:2px solid var(--p);outline-offset:2px}
+
+/* The neighbour list is a table because it is one: seven numbers per row, and
+   columns only mean anything if they line up.  It scrolls sideways inside its
+   card rather than wrapping, because wrapping is what would cost the alignment
+   the table exists for. */
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:8px 0}
+.tbl{border-collapse:collapse;width:100%;min-width:470px;font-size:.75rem}
+.tbl th,.tbl td{padding:7px 9px;text-align:left;white-space:nowrap;
+  border-bottom:1px solid rgba(121,116,126,.16)}
+.tbl th{font-size:.6875rem;font-weight:500;color:var(--on-v);background:var(--sc-low)}
+.tbl th:first-child{border-top-left-radius:var(--r-s)}
+.tbl th:last-child{border-top-right-radius:var(--r-s)}
+.tbl th .u{display:block;font-size:.625rem;font-weight:400;opacity:.75}
+.tbl .num{text-align:right;font-variant-numeric:tabular-nums}
+.tbl .act{text-align:left;width:1%;padding-right:2px}
+.tbl tbody tr:last-child td{border-bottom:0}
+.tbl td .btn{height:28px;padding:0 12px;font-size:.6875rem}
+.tbl .note{font-size:.6875rem;color:var(--on-v);padding:6px 0}
+
+#banner{display:none;position:fixed;inset:0;z-index:20;align-items:center;justify-content:center;
+  padding:24px;background:rgba(28,27,31,.44);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+#banner.on{display:flex}
+.banner-card{background:var(--surf);border-radius:var(--r-xl);padding:24px;width:100%;max-width:420px;
+  text-align:center;box-shadow:var(--e3)}
+.banner-card .who{font-size:1.5rem;font-weight:500;margin:2px 0 20px}
+.banner-card .row{justify-content:center;margin:0}
+
+/* A finger is not a mouse: the small variant is a dense control, and on a
+   touch screen it still has to offer a target worth aiming at. */
+@media (pointer: coarse){
+  .btn.sm,.hist{min-height:40px}
+  .btn.sm{padding:0 16px}
+}
+@media (prefers-reduced-motion: reduce){
+  *{transition-duration:.01ms !important;animation:none !important}
+  .btn:active,.hist:active{transform:none}
+}
 </style></head><body>
-<h1>unisoc-cpd</h1>
-<div class="kv" id="baseband">…</div>
-<div class="chips" id="radio">…</div>
-<div class="chips" id="locks">…</div>
-<div class="chips" id="chips"></div>
-<div id="banner"><div id="bnr-txt" style="font-size:24px">+CRING: VOICE</div>
- <button onclick="act('answer')">接听</button><button class="red" onclick="act('hangup')">挂断</button></div>
+<div class="aura" aria-hidden="true"><i></i><i></i><i></i></div>
 
-<details id="d-identity"><summary>高级信息（ICCID / IMEI / IMSI / IP / 手机号 / SMSC）</summary>
-<button onclick="loadIdentity()">刷新</button>
-<div class="kv" id="identity">展开后读取…</div></details>
+<header class="appbar"><div class="bar">
+ <h1>unisoc-cpd</h1>
+ <div class="hero" id="baseband">…</div>
+ <div class="chips" id="radio">…</div>
+</div></header>
 
-<details id="d-apn"><summary>APN 管理（解析结果 · Modem 上下文 · 覆盖文件）</summary>
-<button onclick="loadApn()">刷新</button>
-<div class="warn">⚠️ APN 有三个地方，别混：① <b>Modem 的 PDP 上下文</b>——承载真正用的是它；
-② <b>覆盖文件</b>——解析顺序里排在 Modem 前面，重启后仍然生效；③ SIM/表的兜底——不可写。
-写入 Modem 后要重建承载才生效（<code>data down</code> 再 <code>data up</code>）；保存到覆盖文件则要重跑承载服务。</div>
-<div class="kv" id="apn-state">展开后读取…</div>
-<div>新 APN <input id="apn-value" size="16" autocomplete="off">
-CID <select id="apn-cid"></select>
-<button onclick="apnSet()">写入 Modem</button>
-<button onclick="apnSave()">保存到覆盖文件</button>
-<button class="red" onclick="apnClear()">清除上下文</button></div>
-<pre id="apn-out">…</pre></details>
+<main class="wrap">
+ <div class="chips" id="locks">…</div>
+ <div class="chips" id="chips"></div>
 
-<details id="d-metrics"><summary>信号详情（RSSI / RSRP / RSRQ / 频率 / 频宽 / PCI / 小区ID · 邻区）</summary>
-<button onclick="loadMetrics()">刷新</button>
-<div class="kv" id="metrics">展开后读取…（要探测测量类 AT，可能较慢）</div></details>
+<details class="card" id="d-sms" open><summary>短信 · inbox<span class="sub">单条删除</span><span class="chev" aria-hidden="true"></span></summary>
+ <div id="msgs">…</div>
+ <h2>发短信</h2>
+ <div class="row"><input id="to" placeholder="+86…" autocomplete="off">
+  <input id="text" placeholder="内容" autocomplete="off">
+  <button class="btn" onclick="sendSms()">发送</button></div>
+ <pre id="sms-out"></pre>
+ <div class="note">删除按索引提交，落在 CP 当前选中的存储上（+CPMS）；每行标出的存储是这条消息
+ 被读到时所在的存储，两者不一致时以删除后重新列出的结果为准。</div></details>
 
-<details id="d-network"><summary>网络（运营商 · 5G SA/NSA · 注册状态）</summary>
-<button onclick="loadNetwork()">刷新</button>
-<div class="kv" id="network">展开后读取…</div></details>
+<section class="card">
+ <h2>电话</h2>
+ <div class="row"><input id="num" placeholder="号码" autocomplete="off">
+  <button class="btn" onclick="dial()">呼叫</button>
+  <button class="btn tonal" onclick="act('answer')">接听</button>
+  <button class="btn red" onclick="act('hangup')">挂断</button></div>
+ <pre id="call-out"></pre></section>
 
-<details id="d-bands"><summary>锁频段（LTE / NR 带号 · AT+SPLBAND）</summary>
-<button onclick="loadLocks()">刷新</button>
-<div class="warn">⚠️ 锁到当前网络用不到的频段会直接失去服务（一直无信号直到解锁）。下面显示的是 CP 读回的
-当前锁定，不是你刚按下的按钮——写入后守护进程会立刻读回比对。</div>
-<div class="kv" id="bands-state">展开后读取…</div>
-<div>LTE <input id="lte-bands" placeholder="1,3,41" size="20" autocomplete="off">
-<button onclick="bandLock('lte')">锁定</button><button class="red" onclick="bandUnlock('lte')">解锁</button></div>
-<div id="band-quick-lte" class="hist"></div>
-<div>NR <input id="nr-bands" placeholder="41,78" size="20" autocomplete="off">
-<button onclick="bandLock('nr')">锁定</button><button class="red" onclick="bandUnlock('nr')">解锁</button></div>
-<div id="band-quick-nr" class="hist"></div>
-<div><button class="red" onclick="bandUnlock('')">LTE+NR 全部解锁</button></div>
-<pre id="bands-out">…</pre></details>
+<details class="card" id="d-identity"><summary>高级信息<span class="sub">ICCID · IMEI · IMSI · IP · IPv6 · SMSC</span><span class="chev" aria-hidden="true"></span></summary>
+ <div class="row tight"><button class="btn tonal sm" onclick="loadIdentity()">刷新</button></div>
+ <div class="kv" id="identity">展开后读取…</div></details>
 
-<details id="d-cells"><summary>锁基站（EARFCN + PCI · AT+SPFORCEFRQ）</summary>
-<button onclick="loadLocks()">刷新</button>
-<div class="warn">⚠️ 锁基站比锁频段更紧：锁到一个不可用的小区会一直无服务。邻区列表里的“锁”会把参数填进来，
-但仍要你按一下才会写。</div>
-<div class="kv" id="cells-state">展开后读取…</div>
-<div>RAT <select id="cell-rat"><option value="lte">LTE</option><option value="nr">NR</option></select>
-EARFCN <input id="cell-freq" size="9" autocomplete="off"> PCI <input id="cell-pci" size="5" autocomplete="off">
-<button onclick="cellLock()">锁定</button><button class="red" onclick="cellUnlock()">解锁</button></div>
-<pre id="cells-out">…</pre></details>
+<details class="card" id="d-apn"><summary>APN 管理<span class="sub">解析结果 · 上下文 · 覆盖文件</span><span class="chev" aria-hidden="true"></span></summary>
+ <div class="warn">APN 有三个地方，别混：① <b>Modem 的 PDP 上下文</b>——承载真正用的是它；
+ ② <b>覆盖文件</b>——解析顺序里排在 Modem 前面，重启后仍然生效；③ SIM/表的兜底——不可写。
+ 写入 Modem 后要重建承载才生效（<code>data down</code> 再 <code>data up</code>）；保存到覆盖文件则要重跑承载服务。</div>
+ <div class="row tight"><button class="btn tonal sm" onclick="loadApn()">刷新</button></div>
+ <div class="kv" id="apn-state">展开后读取…</div>
+ <div class="row"><input id="apn-value" placeholder="新 APN" autocomplete="off">
+  <span class="tag">CID</span><select id="apn-cid"></select>
+  <button class="btn" onclick="apnSet()">写入 Modem</button>
+  <button class="btn tonal" onclick="apnSave()">保存到覆盖文件</button>
+  <button class="btn red" onclick="apnClear()">清除上下文</button></div>
+ <pre id="apn-out">…</pre></details>
 
-<details id="d-imei"><summary>IMEI（读 · 写入[危险 · 二次确认]）</summary>
-<button onclick="loadIdentity()">刷新</button>
-<div class="kv" id="imei-read">展开后读取…</div>
-<div class="warn">⚠️ 写 IMEI 是永久改变这台设备身份的操作，且不可从这里撤销。只对你自己拥有的硬件做：
-恢复被刷坏的出厂值，或给实验机编一个。把设备伪装成另一台在很多司法辖区是犯罪，运营商也会按 IMEI 拉黑。
-守护进程那一侧还压着三道闸：profile 的 <code>[nv].readonly</code>、必须已固定的
-<code>[imei].write_command</code> 模板、写前强制 NV 备份以及写后 diag 独立读回；任何一道不过就是 fail。</div>
-<div>索引 <select id="imei-index"><option value="0">0 · SIM 1</option>
-<option value="1">1 · SIM 2</option><option value="2">2 · spare</option></select>
-新 IMEI（15 位数字）<input id="imei-value" size="18" autocomplete="off"></div>
-<div>再输入一次（确认）<input id="imei-confirm" size="18" autocomplete="off"></div>
-<div><label><input type="checkbox" id="imei-ack"> 我确认这是我拥有的设备，并已读完上面的警告</label></div>
-<div><label><input type="checkbox" id="imei-bad"> 允许校验位不通过（只给实验用的假值）</label></div>
-<button class="red" onclick="imeiWrite()">写入 IMEI</button>
-<pre id="imei-out">…</pre></details>
+<details class="card" id="d-metrics"><summary>信号详情<span class="sub">RSSI · RSRP · RSRQ · SINR · 服务小区</span><span class="chev" aria-hidden="true"></span></summary>
+ <div class="row tight"><button class="btn tonal sm" onclick="loadMetrics()">刷新</button></div>
+ <div class="kv" id="metrics">展开后读取…（要探测测量类 AT，可能较慢）</div></details>
 
-<details id="d-sms" open><summary>短信 · inbox（单条删除）</summary>
-<div id="msgs">…</div>
-<h2 style="font-size:14px">发短信</h2>
-<div><input id="to" placeholder="+86…" size="14"> <input id="text" placeholder="内容" size="24">
-<button onclick="sendSms()">发送</button></div><pre id="sms-out"></pre>
-<div class="hist">删除按索引提交，落在 CP 当前选中的存储上（+CPMS）；每行标出的存储是这条消息
-被读到时所在的存储，两者不一致时以删除后重新列出的结果为准。</div>
-</details>
+<details class="card" id="d-network"><summary>网络<span class="sub">运营商 · 5G SA/NSA · 注册状态</span><span class="chev" aria-hidden="true"></span></summary>
+ <div class="row tight"><button class="btn tonal sm" onclick="loadNetwork()">刷新</button></div>
+ <div class="kv" id="network">展开后读取…</div></details>
 
-<h2>电话</h2>
-<div><input id="num" placeholder="号码" size="14">
-<button onclick="dial()">呼叫</button>
-<button onclick="act('answer')">接听</button>
-<button class="red" onclick="act('hangup')">挂断</button></div><pre id="call-out"></pre>
+<details class="card" id="d-bands"><summary>锁频段<span class="sub">AT+SPLBAND</span><span class="chev" aria-hidden="true"></span></summary>
+ <div class="warn">锁到当前网络用不到的频段会直接失去服务（一直无信号直到解锁）。下面显示的是 CP 读回的
+ 当前锁定，不是你刚按下的按钮——写入后守护进程会立刻读回比对。</div>
+ <div class="row tight"><button class="btn tonal sm" onclick="loadLocks()">刷新</button></div>
+ <div class="kv" id="bands-state">展开后读取…</div>
+ <div class="row"><span class="tag">LTE</span><input id="lte-bands" placeholder="1,3,41" autocomplete="off">
+  <button class="btn" onclick="bandLock('lte')">锁定</button>
+  <button class="btn red" onclick="bandUnlock('lte')">解锁</button></div>
+ <div id="band-quick-lte" class="hist-row"></div>
+ <div class="row"><span class="tag">NR</span><input id="nr-bands" placeholder="41,78" autocomplete="off">
+  <button class="btn" onclick="bandLock('nr')">锁定</button>
+  <button class="btn red" onclick="bandUnlock('nr')">解锁</button></div>
+ <div id="band-quick-nr" class="hist-row"></div>
+ <div class="row"><button class="btn out" onclick="bandUnlock('')">LTE + NR 全部解锁</button></div>
+ <pre id="bands-out">…</pre></details>
 
-<h2>自定义 AT 控制台</h2>
-<div class="warn">⚠️ 这是直通 CP 的原始 AT 通道。查询类（<code>AT+CSQ</code>、<code>AT+CEREG?</code>）是安全的；
-但写类命令（<code>AT+SPLBAND=1,…</code>、<code>AT+SPFORCEFRQ=…</code>、<code>AT+SPIMEI=…</code>、任何厂商
-NV 命令）会立刻并可能永久改变基带配置 / NV，写错可能失联直到恢复出厂。
-命令由持有唯一 AT 通道的守护进程执行，本页只做转发。</div>
-<div><input id="at-cmd" placeholder="AT+CSQ" size="34" autocomplete="off">
-<button onclick="sendAt()">发送</button>
-<button class="red" onclick="clearAtHist()">清空历史</button></div>
-<pre id="at-out">…</pre>
-<div id="at-hist"></div>
+<details class="card" id="d-cells"><summary>锁基站 · 邻区<span class="sub">AT+SPFORCEFRQ</span><span class="chev" aria-hidden="true"></span></summary>
+ <div class="warn">锁基站比锁频段更紧：锁到一个不可用的小区会一直无服务。下表里每一行的「锁」会把那行的参数
+ 填进下面的表单，但仍要你按一下才会写。</div>
+ <div class="row tight"><button class="btn tonal sm" onclick="refreshCells()">刷新</button></div>
+ <div class="kv" id="cells-state">展开后读取…</div>
+ <div id="neighbors"><div class="note">邻区：展开后读取（要探测测量类 AT，可能较慢）</div></div>
+ <h2>手动锁定</h2>
+ <div class="row"><select id="cell-rat"><option value="lte">LTE</option><option value="nr">NR</option></select>
+  <span class="pair"><span class="tag">EARFCN</span><input class="w-num" id="cell-freq" autocomplete="off"></span>
+  <span class="pair"><span class="tag">PCI</span><input class="w-num" id="cell-pci" autocomplete="off"></span>
+  <button class="btn" onclick="cellLock()">锁定</button>
+  <button class="btn red" onclick="cellUnlock()">解锁</button></div>
+ <pre id="cells-out">…</pre></details>
 
-<h2>事件流（urc） <button onclick="clearUrc()">清空显示</button>
-<button onclick="showAllUrc()">显示全部</button></h2>
-<div class="hist" id="urc-note"></div>
-<pre id="urc-out">…</pre>
-<h2>状态详情</h2><pre id="stat-out">…</pre>
+<details class="card" id="d-imei"><summary>IMEI<span class="sub">读 · 写入（危险 · 二次确认）</span><span class="chev" aria-hidden="true"></span></summary>
+ <div class="row tight"><button class="btn tonal sm" onclick="loadIdentity()">刷新</button></div>
+ <div class="kv" id="imei-read">展开后读取…</div>
+ <div class="warn">写 IMEI 是永久改变这台设备身份的操作，且不可从这里撤销。只对你自己拥有的硬件做：
+ 恢复被刷坏的出厂值，或给实验机编一个。把设备伪装成另一台在很多司法辖区是犯罪，运营商也会按 IMEI 拉黑。
+ 守护进程那一侧还压着三道闸：profile 的 <code>[nv].readonly</code>、必须已固定的
+ <code>[imei].write_command</code> 模板、写前强制 NV 备份以及写后 diag 独立读回；任何一道不过就是 fail。</div>
+ <div class="row"><span class="tag">索引</span><select id="imei-index"><option value="0">0 · SIM 1</option>
+  <option value="1">1 · SIM 2</option><option value="2">2 · spare</option></select></div>
+ <div class="row"><input id="imei-value" placeholder="新 IMEI（15 位数字）" autocomplete="off"></div>
+ <div class="row"><input id="imei-confirm" placeholder="再输入一次（确认）" autocomplete="off"></div>
+ <div><label><input type="checkbox" id="imei-ack"> 我确认这是我拥有的设备，并已读完上面的警告</label></div>
+ <div><label><input type="checkbox" id="imei-bad"> 允许校验位不通过（只给实验用的假值）</label></div>
+ <div class="row"><button class="btn red" onclick="imeiWrite()">写入 IMEI</button></div>
+ <pre id="imei-out">…</pre></details>
+
+
+<section class="card">
+ <h2>自定义 AT 控制台</h2>
+ <div class="warn">这是直通 CP 的原始 AT 通道。查询类（<code>AT+CSQ</code>、<code>AT+CEREG?</code>）是安全的；
+ 但写类命令（<code>AT+SPLBAND=1,…</code>、<code>AT+SPFORCEFRQ=…</code>、<code>AT+SPIMEI=…</code>、任何厂商
+ NV 命令）会立刻并可能永久改变基带配置 / NV，写错可能失联直到恢复出厂。
+ 命令由持有唯一 AT 通道的守护进程执行，本页只做转发。</div>
+ <div class="row"><input id="at-cmd" placeholder="AT+CSQ" autocomplete="off">
+  <button class="btn" onclick="sendAt()">发送</button>
+  <button class="btn text" onclick="clearAtHist()">清空历史</button></div>
+ <pre id="at-out">…</pre>
+ <div id="at-hist" class="hist-row"></div></section>
+
+<section class="card">
+ <h2>事件流 · urc</h2>
+ <div class="row tight"><button class="btn tonal sm" onclick="clearUrc()">清空显示</button>
+  <button class="btn text" onclick="showAllUrc()">显示全部</button></div>
+ <div class="note" id="urc-note"></div>
+ <pre id="urc-out">…</pre></section>
+
+<details class="card" id="d-stat"><summary>状态详情<span class="sub">register · signal · ims</span><span class="chev" aria-hidden="true"></span></summary>
+ <pre id="stat-out">…</pre></details>
+</main>
+
+<div id="banner" role="dialog" aria-modal="true" aria-labelledby="bnr-txt">
+ <div class="banner-card">
+  <div class="who" id="bnr-txt">+CRING: VOICE</div>
+  <div class="row"><button class="btn" onclick="act('answer')">接听</button>
+   <button class="btn red" onclick="act('hangup')">挂断</button></div>
+ </div></div>
 
 <script>
 function out(id, resp){ document.getElementById(id).textContent =
@@ -973,7 +1172,7 @@ async function post(u, data){ const r = await fetch(u, {method:'POST',
   headers:{'Content-Type':'application/x-www-form-urlencoded'},
   body: new URLSearchParams(data).toString()}); return r.json(); }
 function chip(list, label, cls){
-  return '<span class="'+(cls||'')+'">'+label+'</span>'; }
+  return '<span class="chip '+(cls||'')+'">'+label+'</span>'; }
 async function refreshState(){ try{ const d = await get('/api/state'); const s = d.state||{};
   const a = s.at||{}; const c = (s.channels||{}).cmd||{};
   const age = (s.last_ok_age_s==null) ? 'never' : Math.round(s.last_ok_age_s)+'s';
@@ -1037,19 +1236,19 @@ async function refreshUrc(){ try{ const d = await get('/api/urc'); const us = d.
   // not what "clear the log" means.
   const ring = us.filter(isRing);
   const b = document.getElementById('banner');
-  if(ring.length){ if(b.style.display!=='block'){ b.style.display='block';
+  if(ring.length){ if(!b.classList.contains('on')){ b.classList.add('on');
     const o = ring[ring.length-1].urc;
     document.getElementById('bnr-txt').textContent = (o&&o.kind) ? '来电 '+(o.number||'') : String(o); } }
-  else { b.style.display='none'; }
+  else { b.classList.remove('on'); }
  }catch(e){} }
 async function refreshMsgs(){ try{ const d = await get('/api/messages'); const ms = d.messages||[];
   document.getElementById('msgs').innerHTML = ms.map(function(m){
-   return '<div class="msg"><span class="from">'+esc(m.from)+'</span> '
-    + esc((m.storage||'')+'['+m.index+'] '+(m.timestamp||''))
-    + '<button class="red" style="float:right;padding:2px 8px;font-size:12px"'
-    + ' onclick="delSms('+m.index+')">删除</button>'
-    + '<br>'+esc(m.text||'')+'</div>';}).join('')
-   || '（空）';
+   return '<div class="msg"><span class="from">'+esc(m.from)+'</span>'
+    + '<span class="meta">'+esc((m.storage||'')+'['+m.index+'] '+(m.timestamp||''))+'</span>'
+    + '<div class="body">'+esc(m.text||'')+'</div>'
+    + '<div class="row"><button class="btn red sm"'
+    + ' onclick="delSms('+m.index+')">删除</button></div></div>';}).join('')
+   || '<div class="note">（空）</div>';
  }catch(e){} }
 async function delSms(index){
   // A delete is the one thing here that changes what is stored on the SIM or
@@ -1063,16 +1262,20 @@ async function sendSms(){ const r = await post('/api/send',
 async function dial(){ const r = await post('/api/dial', {number:document.getElementById('num').value});
  out('call-out', r); }
 async function act(w){ const r = await post('/api/'+w, {}); out('call-out', r);
- if(w!=='hangup') setTimeout(function(){document.getElementById('banner').style.display='none';}, 800); }
+ if(w!=='hangup') setTimeout(function(){document.getElementById('banner').classList.remove('on');}, 800); }
 
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
 function kv(label, value){
   return '<div><b>'+label+'</b>'+(value==null||value===''
     ? '<span class="dim">未上报</span>' : esc(value))+'</div>'; }
 async function refreshInfo(){ try{ const d = await get('/api/info');
+  // The keys are the ones `link info` actually emits -- `hardware` is the
+  // board the CP reports, and reading `revision` here left that pill empty.
   document.getElementById('baseband').innerHTML =
-    kv('基带', (d.model||'—') + ' · ' + (d.firmware||'—')
-      + (d.hardware ? ' · ' + d.hardware : '') + ' · ' + (d.profile||'—')); }catch(e){} }
+    '<b>'+esc(d.model||'—')+'</b>'
+    + '<em>'+esc(d.firmware||'—')+'</em>'
+    + (d.hardware ? '<em>'+esc(d.hardware)+'</em>' : '')
+    + (d.profile ? '<em>'+esc(d.profile)+'</em>' : ''); }catch(e){} }
 async function loadIdentity(){
   const el = document.getElementById('identity'); el.textContent = '读取中…';
   try{ const d = await get('/api/identity'); let h = '';
@@ -1080,7 +1283,13 @@ async function loadIdentity(){
     (d.imei||[]).forEach(function(e){
       h += kv('IMEI' + e.index + ' (' + (e.slot||'') + ')',
               e.value ? (e.value + (e.luhn===false ? '  ⚠ Luhn 校验不过' : '')) : (e.detail||'读取失败')); });
-    h += kv('IP', d.ip); h += kv('APN', d.apn); h += kv('DNS', d.dns); h += kv('SMSC', d.smsc);
+    h += kv('IPv4', d.ip);
+    // The two v6 answers are separate facts: what the context was given, and
+    // what the host ended up with.  One without the other is a real state.
+    h += kv('IPv6 · 承载', d.ip6);
+    h += kv('IPv6 · 接口', d.ip6_interface);
+    h += kv('IPv6 DNS', d.ip6_dns);
+    h += kv('APN', d.apn); h += kv('DNS', d.dns); h += kv('SMSC', d.smsc);
     (d.errors||[]).forEach(function(x){ h += '<div class="err">'+esc(x)+'</div>'; });
     el.innerHTML = h;
     const ie = document.getElementById('imei-read');
@@ -1105,9 +1314,51 @@ async function imeiWrite(){
     imei:v, confirm:c, index:idx, acknowledged:'yes',
     allow_bad_checksum: document.getElementById('imei-bad').checked ? 'yes' : 'no' }));
   loadIdentity(); }
+// The neighbour list belongs in the cell-lock card: it is where the lock
+// decision comes from, and every row writes into the form below it.  As a
+// table, because a list of seven numbers per row is only readable when the
+// columns line up -- which is the whole reason it is not a paragraph.
+function neighborTable(el, d){
+  if(!el) return;
+  const ns = d.neighbors || [];
+  const lte = d.neighbors_lte, nr = d.neighbors_nr;
+  const counts = 'LTE ' + (lte!=null ? lte+' 个' : '未上报')
+    + ' · NR ' + (nr!=null ? nr+' 个' : '未上报');
+  if(!ns.length && lte==null && nr==null){
+    el.innerHTML = '<div class="note">CP 未上报邻区列表（SPENGMD 邻区查询无应答，或本代不支持）</div>';
+    return;
+  }
+  // The lock button is the point of the table, so it is the first column: a
+  // narrow screen scrolls the numbers sideways, and an action that scrolls out
+  // of reach is an action nobody takes.
+  const rows = ns.map(function(n){
+    const attrs = ' data-rat="' + (n.rat==='NR' ? 'nr':'lte') + '" data-freq="' + n.earfcn
+      + '" data-pci="' + n.pci + '"';
+    const call = 'lockNeighbor(this.getAttribute(\'data-rat\'),'
+      + 'this.getAttribute(\'data-freq\'),this.getAttribute(\'data-pci\'))';
+    return '<tr><td class="act"><button class="btn tonal sm"' + attrs
+      + ' onclick="' + call + '">锁</button></td>'
+      + '<td>' + esc(n.rat) + '</td><td>' + esc(n.band||'—') + '</td>'
+      + '<td class="num">' + n.earfcn + '</td><td class="num">' + n.pci + '</td>'
+      + '<td class="num">' + n.rsrp + '</td><td class="num">' + n.rsrq + '</td>'
+      + '<td class="num">' + (n.sinr==null ? '—' : n.sinr) + '</td></tr>';
+  }).join('');
+  const header = ns.length
+    ? '<div class="scroll"><table class="tbl" aria-label="邻区列表，每行可锁定">'
+      + '<thead><tr><th class="act"></th><th>RAT</th><th>band</th>'
+      + '<th class="num">EARFCN</th><th class="num">PCI</th>'
+      + '<th class="num">RSRP<span class="u">dBm</span></th>'
+      + '<th class="num">RSRQ<span class="u">dB</span></th>'
+      + '<th class="num">SINR<span class="u">dB</span></th>'
+      + '</tr></thead><tbody>' + rows + '</tbody></table></div>'
+    : '<div class="note">范围内没有读到邻区</div>';
+  el.innerHTML = '<div class="note">' + counts + '</div>' + header;
+}
 async function loadMetrics(){
   const el = document.getElementById('metrics');
+  const nb = document.getElementById('neighbors');
   el.textContent = '读取中…（要探测测量类 AT，可能几十秒）';
+  if(nb) nb.innerHTML = '<div class="note">读取中…</div>';
   try{ const d = await get('/api/metrics'); let h = '';
     h += kv('RSSI', d.rssi_dbm!=null ? d.rssi_dbm+' dBm' : null);
     h += kv('RSRP', d.rsrp_dbm!=null
@@ -1121,18 +1372,14 @@ async function loadMetrics(){
         + ' · PCI ' + (s.pci!=null?s.pci:'—') + ' · 频宽 ' + (s.bandwidth||'—')
         + ' · 小区ID ' + (s.cell||'—')); }
     h += cell('LTE', d.lte); h += cell('NR', d.nr);
-    h += kv('邻区 LTE', d.neighbors_lte!=null ? d.neighbors_lte+' 个' : null);
-    h += kv('邻区 NR', d.neighbors_nr!=null ? d.neighbors_nr+' 个' : null);
-    (d.neighbors||[]).forEach(function(n){
-      h += '<div>' + esc(n.rat + '  band ' + (n.band||'—') + '  EARFCN ' + n.earfcn
-        + '  PCI ' + n.pci + '  RSRP ' + n.rsrp + ' dBm  RSRQ ' + n.rsrq + ' dB'
-        + (n.sinr!=null ? '  SINR ' + n.sinr + ' dB' : ''))
-        + ' <button onclick="lockNeighbor(this.getAttribute(\'data-rat\'), this.getAttribute(\'data-freq\'), this.getAttribute(\'data-pci\'))"'
-        + ' data-rat="' + (n.rat==='NR'?'nr':'lte') + '" data-freq="' + n.earfcn + '" data-pci="' + n.pci + '"'
-        + '>锁</button></div>'; });
     if(!d.serving_supported) h += '<div class="err">CP 未上报服务小区测量（本代可能不支持 SPENGMD 测量树）</div>';
     el.innerHTML = h;
-  }catch(e){ el.textContent = '读取失败: '+e; } }
+    neighborTable(nb, d);
+  }catch(e){ el.textContent = '读取失败: '+e;
+    if(nb) nb.innerHTML = '<div class="note">读取失败: '+esc(e)+'</div>'; } }
+// The lock card shows the state and the neighbours, and both come from asking
+// the CP, so one button refreshes the pair rather than one each.
+function refreshCells(){ loadLocks(); loadMetrics(); }
 async function loadNetwork(){
   const el = document.getElementById('network'); el.textContent = '读取中…';
   try{ const d = await get('/api/network'); let h = '';
@@ -1147,9 +1394,9 @@ var COMMON_LTE = [1,3,5,8,34,38,39,40,41];
 var COMMON_NR = [1,28,41,77,78,79];
 function quickBands(){
   function render(id, rat, bands){
-    document.getElementById(id).innerHTML = '常用：' + bands.map(function(b){
+    document.getElementById(id).innerHTML = '<span class="note">常用</span>' + bands.map(function(b){
       return '<span class="hist" onclick="addBand(this)" data-rat="'+rat+'" data-band="'+b+'">n'+b+'</span>';
-    }).join(' ');
+    }).join('');
   }
   render('band-quick-lte','lte',COMMON_LTE); render('band-quick-nr','nr',COMMON_NR);
 }
@@ -1163,11 +1410,13 @@ function addBand(el){
 function locksChips(d){
   const lb = (d.lte_bands||[]), nb = (d.nr_bands||[]);
   const lc = (d.lte_cells||[]), nc = (d.nr_cells||[]);
+  // A lock is a state that was asked for, not a fault: it gets the attention
+  // tone, and the error tone stays for things that are actually wrong.
   document.getElementById('locks').innerHTML =
-    chip(0, lb.length ? 'LTE 锁 band '+lb.join(',') : 'LTE 未锁频段', lb.length?'bad':'dim') +
-    chip(0, nb.length ? 'NR 锁 band '+nb.join(',') : 'NR 未锁频段', nb.length?'bad':'dim') +
+    chip(0, lb.length ? 'LTE 锁 band '+lb.join(',') : 'LTE 未锁频段', lb.length?'warn':'dim') +
+    chip(0, nb.length ? 'NR 锁 band '+nb.join(',') : 'NR 未锁频段', nb.length?'warn':'dim') +
     chip(0, (lc.length+nc.length) ? '已锁基站 '+(lc.length+nc.length)+' 个' : '未锁基站',
-         (lc.length+nc.length)?'bad':'dim');
+         (lc.length+nc.length)?'warn':'dim');
 }
 function cellsText(rat, cells){
   return cells.length
@@ -1213,8 +1462,8 @@ async function loadApn(){
     h += kv('覆盖文件路径', d.apn_source_path);
     h += kv('默认 CID', d.cid);
     (d.contexts||[]).forEach(function(c){
-      h += '<div><b>CID '+c.cid+'</b>'+(c.apn ? esc(c.apn) : '（无 APN）')
-        + (c.pdp_type ? ' · '+esc(c.pdp_type) : '') + (c.state ? ' · '+esc(c.state) : '') + '</div>'; });
+      h += '<div><b>CID '+c.cid+'</b><span>'+(c.apn ? esc(c.apn) : '（无 APN）')
+        + (c.pdp_type ? ' · '+esc(c.pdp_type) : '') + (c.state ? ' · '+esc(c.state) : '') + '</span></div>'; });
     el.innerHTML = h;
     // The contexts the CP actually has, so the CID is picked rather than
     // typed: the device carries more than one (data and IMS), and a typo here
@@ -1247,7 +1496,7 @@ function lazyLoad(){
   document.getElementById('d-network').addEventListener('toggle', function(){ if(this.open) loadNetwork(); });
   document.getElementById('d-apn').addEventListener('toggle', function(){ if(this.open) loadApn(); });
   document.getElementById('d-bands').addEventListener('toggle', function(){ if(this.open) loadLocks(); });
-  document.getElementById('d-cells').addEventListener('toggle', function(){ if(this.open) loadLocks(); });
+  document.getElementById('d-cells').addEventListener('toggle', function(){ if(this.open) refreshCells(); });
   document.getElementById('d-imei').addEventListener('toggle', function(){ if(this.open) loadIdentity(); });
 }
 
@@ -1258,8 +1507,8 @@ function renderAtHist(){
     ? atHist.map(function(c){
         var esc = c.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
         return '<span class="hist" onclick="useAt(this)" data-cmd="'+esc+'">'+esc+'</span>';
-      }).join(' · ')
-    : '<span class="hist">（无历史）</span>';
+      }).join('')
+    : '<span class="note">（无历史）</span>';
 }
 function useAt(el){ document.getElementById('at-cmd').value = el.getAttribute('data-cmd'); }
 function clearAtHist(){ atHist = []; localStorage.setItem('atHist','[]'); renderAtHist(); }
