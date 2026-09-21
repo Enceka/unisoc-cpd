@@ -32,7 +32,8 @@ unisoc-cpd / ucpd              一个二进制，一份 profile
 ├── platform/profiles/mu300.toml  第二个平台，同一核心（桩，未验证）
 ├── units/                     systemd 单元：浸泡（timer）+ 常驻持有者
 ├── tools/build-aarch64.sh     交叉编译脚本
-└── docs/BASEBAND-CONTRACTS.md 通道/命令/时序契约（§9 是 G2 的控制面契约）
+├── docs/BASEBAND-CONTRACTS.md 通道/命令/时序契约（§9 是 G2 的控制面契约）
+└── docs/FINDINGS.md           本仓库自己实测得出的结论，逐条编号
 ```
 
 ## 3. 构建与测试
@@ -248,7 +249,7 @@ systemctl stop e5-mobile-data-watch e5-mobile-data e5-atd
 | **G2 控制面（`serve`）** | 代码与离线测试就绪：常驻独占两条通道、URC 事件、socket 上的能力请求、空闲探活、`state`（含 `last_ok_age_s`）。**未上真机**——还没当过 `/dev/stty_nr1` 的主人 |
 | aarch64 构建 | 静态 `aarch64-unknown-linux-musl`，`tools/build-aarch64.sh` 可复现 |
 | **真机只读验证** | ✅ 已做：`diag spools`（8 个节点，全部 `char`）、`diag mailbox`、`diag asserts`（0 次 assert）、`nv list`（7 个分区）。每次运行的摘要都显示 `at.commands: 0`、`channels.cmd.opens: 0`，即**全程没有打开过 AT 通道** |
-| **真机接管 AT** | ✅ **Android 侧已做**（2026-09-20）：`stop vendor.ril-daemon` 后守护进程成为两条通道的唯一读者，`link`/`sim`/`band`/`serve`+socket 全部实测通过，0 次 CP assert，URC 解码 50/50；交接规程与栈冷启动要求见 FINDINGS §25。Linux 侧还没在开机时当过主人，没跑过浸泡，profile 仍 `verified = false` |
+| **真机接管 AT** | ✅ **Android 侧已做**（2026-09-20）：`stop vendor.ril-daemon` 后守护进程成为两条通道的唯一读者，`link`/`sim`/`band`/`serve`+socket 全部实测通过，0 次 CP assert，URC 解码 50/50；交接规程与栈冷启动要求见 FINDINGS §1–§2。Linux 侧还没在开机时当过主人，没跑过浸泡，profile 仍 `verified = false` |
 | log/dump spool 排空、`stime_ch` | ❌ 未实现（W1 遗留） |
 | 语音 CS | ❌ `voice.supported = false`：本平台还没有 UCM/语音路由 |
 

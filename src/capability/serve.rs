@@ -460,7 +460,7 @@ struct State {
     probe_failures: u64,
     /// Age of the last command the CP actually answered — the number a watchdog
     /// keys on, because "the channel is open" and "the CP is answering" are two
-    /// different facts (`docs/FINDINGS.md` §22).
+    /// different facts (`docs/FINDINGS.md` §12).
     last_ok_age_s: Option<f64>,
     at: AtMetrics,
     channels: BTreeMap<String, ChannelMetrics>,

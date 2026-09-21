@@ -59,7 +59,7 @@ pub struct Channels {
 #[serde(default)]
 pub struct AtOptions {
     /// Minimum gap between two writes to the command channel.  The CP asserts
-    /// when its queue is filled by unpaced AT (docs/FINDINGS.md 22).
+    /// when its queue is filled by unpaced AT (docs/FINDINGS.md 12).
     pub pace_seconds: f64,
     pub default_timeout: f64,
     pub reopen_backoff: f64,

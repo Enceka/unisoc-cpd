@@ -26,7 +26,8 @@ unisoc-cpd                     one binary, one profile
 ├── src/profile_check.rs       the A12 gate, as a command
 ├── platform/profiles/e5.toml      the only file that knows about the E5
 ├── platform/profiles/mu300.toml   second platform, same core (stub, unverified)
-└── docs/BASEBAND-CONTRACTS.md     W0: the channel/command/timing contract (§9: G2)
+├── docs/BASEBAND-CONTRACTS.md     W0: the channel/command/timing contract (§9: G2)
+└── docs/FINDINGS.md               what the sessions taught, one numbered lesson each
 ```
 
 ## Build
@@ -166,7 +167,7 @@ systemctl stop e5-mobile-data-watch e5-mobile-data e5-atd
 | A12 `profile-check` | pass (two profiles, no platform names in the core) |
 | aarch64 build | static `aarch64-unknown-linux-musl`, built by `tools/build-aarch64.sh` |
 | on-device, read-only | verified on the handset: `diag spools` (8 nodes, all `char`), `diag mailbox`, `diag asserts` (0 CP asserts), `nv list` (7 partitions). Each run's summary shows `at.commands: 0` and `channels.cmd.opens: 0` — the AT channel is deliberately not touched while the vendor RIL owns it |
-| on-device, AT | **measured on the Android side** (2026-09-20): after `stop vendor.ril-daemon` the daemon was the only reader of both channels — `link`, `sim`, `band`, `serve` + socket clients all passed with 0 CP asserts and 50/50 URC lines decoded; the transfer rule and the stack cold-cycle requirement are in FINDINGS §25. **Not yet at boot on the Linux side**, not soaked, no profile is `verified` |
+| on-device, AT | **measured on the Android side** (2026-09-20): after `stop vendor.ril-daemon` the daemon was the only reader of both channels — `link`, `sim`, `band`, `serve` + socket clients all passed with 0 CP asserts and 50/50 URC lines decoded; the transfer rule and the stack cold-cycle requirement are in FINDINGS §1–§2. **Not yet at boot on the Linux side**, not soaked, no profile is `verified` |
 | log/dump spool drains, `stime_ch` | not implemented (W1, still open) |
 | voice | `voice.supported = false`: no UCM/voice route on this platform yet |
 

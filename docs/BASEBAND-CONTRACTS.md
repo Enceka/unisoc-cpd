@@ -109,7 +109,7 @@ way it is:
 | SIM | `AT+CPIN?` → `+CPIN: READY` | `AT+CPIN="<pin>"` to unlock |
 | SIM identity | `AT+CIMI`, `AT+CCID` | read-only; **no IMEI path exists in this program** |
 | radio | `AT+CFUN?` → `+CFUN: 1` | a cold CP can read `1` with the stack still down |
-| stack on | `AT+SFUN=2`, `AT+SFUN=4` | the vendor-specific "really turn the stack on"; **after a RIL shutdown parks the radio at `+CFUN: 0`, this pair alone sets `+CFUN: 1` but does not register — the cold cycle `AT+CFUN=0` then `SFUN=2/4` is what does (measured, FINDINGS §25.3)** |
+| stack on | `AT+SFUN=2`, `AT+SFUN=4` | the vendor-specific "really turn the stack on"; **after a RIL shutdown parks the radio at `+CFUN: 0`, this pair alone sets `+CFUN: 1` but does not register — the cold cycle `AT+CFUN=0` then `SFUN=2/4` is what does (measured, FINDINGS §2)** |
 | stack cycle | `AT+SFUN=5`, `AT+SFUN=3` | **avoid**: leaves this modem's SIM undetected until reboot |
 | registration | `AT+CEREG?`, `AT+CREG?`, `AT+CGATT?` | AcT is the 5th field: 11 = NR SA, 13 = EN-DC |
 | signal | `AT+CSQ`, `AT+CESQ` | `+CESQ: rxlev,ber,rscp,ecno,rsrq,rsrp,ssrsrq,ssrsrp,sssinr`; index→dBm is `idx-140` for RSRP, and **255 means "not reported", not `idx 255` (measured: an unregistered CP answers 255 in every field)** |
@@ -328,7 +328,7 @@ slot a, with the daemon as the only reader of both channels after
 `stop vendor.ril-daemon` — ownership, `link`, `sim`, `band`, `serve` + socket
 clients, and URC decoding all measured working; the ownership *transfer*
 procedure picked up one rule and the stack bring-up one requirement
-(FINDINGS §25).  Still open: the same on the Linux side, where the daemon has
+(FINDINGS §1–§2).  Still open: the same on the Linux side, where the daemon has
 not yet been the owner at boot.
 
 ### 9.1 Ownership over a boot, not over a command
@@ -348,7 +348,7 @@ holds across the whole measurement window instead of across one command.
 `AT`, counted under `at.probes`, never under `at.commands`) runs whenever
 nothing else has touched the CP for `at.idle_probe_seconds`, and `state`
 reports `last_ok_age_s`, the number a watchdog keys on, because an open
-channel and an answering CP are two different facts (FINDINGS §22).
+channel and an answering CP are two different facts (FINDINGS §12).
 
 ### 9.2 The unsolicited stream, decoded
 

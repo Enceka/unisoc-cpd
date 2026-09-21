@@ -137,7 +137,7 @@ impl Capability for Cfun {
                     .map(|l| l.contains('1'))
                     .unwrap_or(false);
             }
-            // FINDINGS 25.3: a RIL shutdown parks the CP at +CFUN: 0, and there the
+            // FINDINGS 2: a RIL shutdown parks the CP at +CFUN: 0, and there the
             // SFUN pair alone is not stack bring-up -- +CFUN: 1 comes back with no
             // registration.  The cold cycle is the documented recovery for that
             // state, and the one to run when `on` leaves +CFUN: 1 but no RF.
