@@ -106,6 +106,9 @@ fn web_serves_the_page_and_the_daemons_state() {
     let mut state_ok = false;
     let mut dial_ok = false;
     let mut at_ok = false;
+    let mut info_ok = false;
+    let mut identity_ok = false;
+    let mut network_ok = false;
     for _ in 0..50 {
         std::thread::sleep(Duration::from_millis(200));
         if let Some(body) = http_try(port, "/") {
@@ -124,7 +127,26 @@ fn web_serves_the_page_and_the_daemons_state() {
                 at_ok |= body.contains("+CSQ: 23,99");
             }
         }
-        if page_ok && state_ok && dial_ok && at_ok {
+        if !info_ok {
+            // `link info` runs over the same socket; its summary lines are
+            // what the baseband bar reads.
+            if let Some(body) = http_try(port, "/api/info") {
+                info_ok |= body.contains("FAKE-CP-MODEL") && body.contains("FAKE-FW-0.0.1");
+            }
+        }
+        if !identity_ok {
+            if let Some(body) = http_try(port, "/api/identity") {
+                identity_ok |= body.contains("8986012345678901234")
+                    && body.contains("+8613800138000")
+                    && body.contains("460011234567890");
+            }
+        }
+        if !network_ok {
+            if let Some(body) = http_try(port, "/api/network") {
+                network_ok |= body.contains("46001") && body.contains("5G SA");
+            }
+        }
+        if page_ok && state_ok && dial_ok && at_ok && info_ok && identity_ok && network_ok {
             break;
         }
     }
@@ -135,4 +157,7 @@ fn web_serves_the_page_and_the_daemons_state() {
     assert!(state_ok, "/api/state did not answer");
     assert!(dial_ok, "/api/urc did not answer");
     assert!(at_ok, "/api/at did not run AT+CSQ through the daemon");
+    assert!(info_ok, "/api/info did not report the CP identity");
+    assert!(identity_ok, "/api/identity did not report ICCID/phone/IMSI");
+    assert!(network_ok, "/api/network did not report the operator and the RAT");
 }

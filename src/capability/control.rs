@@ -51,13 +51,27 @@ impl Capability for Sim {
             // Read-only SIM identity, deliberately behind its own action.  The
             // rig needs the ICCID to tell two SIMs apart; device identity
             // (IMEI) lives in its own guarded `imei` capability, so nothing
-            // identity-related hides in here.
+            // identity-related hides in here.  `+CNUM` is the SIM's own
+            // MSISDN, which many cards leave unprovisioned: it is read and
+            // reported, but its absence is not a failure of the read.
             let imsi = session.command("AT+CIMI", t, &[], 0);
             let iccid = session.command("AT+CCID", t, &[], 0);
-            let ok = each(&mut out, &[("AT+CIMI", imsi), ("AT+CCID", iccid)]);
-            return Ok(outcome(out, ok));
+            let cnum = session.command("AT+CNUM", t, &[], 0);
+            emit(&mut out, "AT+CIMI", &imsi);
+            emit(&mut out, "AT+CCID", &iccid);
+            emit(&mut out, "AT+CNUM", &cnum);
+            out.push(format!("imsi: {}", imsi_value(&imsi)));
+            out.push(format!("iccid: {}", iccid_value(&iccid)));
+            let phone = cnum_value(&cnum);
+            out.push(format!("phone: {}", phone.as_deref().unwrap_or("-")));
+            if phone.is_none() {
+                ctx.note(
+                    "AT+CNUM carried no MSISDN: many SIMs are not provisioned with one"
+                        .to_string(),
+                );
+            }
+            return Ok(outcome(out, imsi.ok() && iccid.ok()));
         }
-
         if let Some(pin) = pos.first() {
             if pin != "info" {
                 let cmd = format!("AT+CPIN=\"{pin}\"");
@@ -90,6 +104,71 @@ impl Capability for Sim {
         }
         Ok(outcome(out, r.ok() && ready))
     }
+}
+
+/// `AT+CIMI` answers the IMSI bare: the first line that is all digits.
+fn imsi_value(reply: &crate::at::Reply) -> String {
+    reply
+        .lines
+        .iter()
+        .map(|l| l.trim())
+        .find(|l| l.len() >= 6 && l.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or("-")
+        .to_string()
+}
+
+/// `+CCID: 8986012345678901234`
+fn iccid_value(reply: &crate::at::Reply) -> String {
+    reply
+        .first_with_prefix("+CCID:")
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim().trim_matches('"').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// `+CNUM: "","+8613800138000",145` — the address is the field after the
+/// alpha tag.  A card with no MSISDN answers with nothing to report.
+fn cnum_value(reply: &crate::at::Reply) -> Option<String> {
+    let line = reply.first_with_prefix("+CNUM:")?;
+    let fields = split_fields(line.split_once(':')?.1);
+    fields
+        .iter()
+        .map(|f| f.trim().trim_matches('"'))
+        .find(|f| !f.is_empty() && f.chars().all(|c| c.is_ascii_digit() || c == '+' || c == '*'))
+        .map(|f| f.to_string())
+}
+
+/// The payload of a `+CEREG:`-style answer, for the summary lines a client
+/// reads instead of re-parsing AT framing.  `-` means the modem did not answer
+/// the query at all, which is a different fact from an empty answer.
+fn reg_value(reply: &crate::at::Reply, prefix: &str) -> String {
+    reply
+        .first_with_prefix(prefix)
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// `+COPS:`'s comma-separated fields, quote-aware (an operator name may be
+/// spelled in any of three formats, and the numeric one is quoted).
+fn cops_fields(reply: &crate::at::Reply) -> Option<Vec<String>> {
+    let line = reply.first_with_prefix("+COPS:")?;
+    Some(split_fields(line.split_once(':')?.1))
+}
+
+/// The operator's name for an MCC-MNC, where this build knows one.  The
+/// mapping is public numbering-plan data, not a device identifier; an unknown
+/// code is reported as unknown rather than guessed at.
+pub fn operator_name(numeric: &str) -> Option<&'static str> {
+    Some(match numeric {
+        "46000" | "46002" | "46004" | "46007" | "46008" => "中国移动",
+        "46001" | "46006" | "46009" => "中国联通",
+        "46003" | "46005" | "46011" => "中国电信",
+        "46015" => "中国广电",
+        _ => return None,
+    })
 }
 
 // ---------------------------------------------------------------------- CFUN
@@ -202,24 +281,27 @@ impl Capability for Register {
                 let gatt = session.command("AT+CGATT?", t, &[], 0);
                 // +C5GREG is this generation's 5G SA registration query.
                 let c5greg = session.command("AT+C5GREG?", t, &[], 0);
-                let ok = each(
-                    &mut out,
-                    &[
-                        ("AT+CEREG?", cereg),
-                        ("AT+CREG?", creg),
-                        ("AT+CGATT?", gatt),
-                        ("AT+C5GREG?", c5greg),
-                    ],
-                );
+                for (cmd, reply) in [
+                    ("AT+CEREG?", &cereg),
+                    ("AT+CREG?", &creg),
+                    ("AT+CGATT?", &gatt),
+                    ("AT+C5GREG?", &c5greg),
+                ] {
+                    emit(&mut out, cmd, reply);
+                }
+                let ok = cereg.ok() && creg.ok() && gatt.ok() && c5greg.ok();
 
-                // AcT 1/5 registered, 11 = NR SA, 13 = EN-DC.
-                let stat = out
-                    .iter()
-                    .find(|l| l.trim_start().starts_with("+CEREG:"))
-                    .map(|l| l.trim().to_string())
-                    .unwrap_or_default();
-                if stat.contains(": 0,") {
-                    ctx.note(format!("not registered: {stat}"));
+                // The summary lines a client reads without re-parsing AT: the
+                // `+CEREG` shape is `n,stat[,tac,ci,act]`, and `act` (11 = NR
+                // SA, 13 = EN-DC) is what tells SA from NSA.
+                out.push(format!("cereg: {}", reg_value(&cereg, "+CEREG:")));
+                out.push(format!("creg: {}", reg_value(&creg, "+CREG:")));
+                out.push(format!("c5greg: {}", reg_value(&c5greg, "+C5GREG:")));
+                out.push(format!("gatt: {}", reg_value(&gatt, "+CGATT:")));
+
+                let stat = reg_value(&cereg, "+CEREG:");
+                if stat.starts_with("0,") {
+                    ctx.note(format!("not registered: +CEREG: {stat}"));
                 }
                 Ok(outcome(out, ok))
             }
@@ -345,6 +427,20 @@ impl Capability for Operator {
             "status" => {
                 let r = session.command("AT+COPS?", Duration::from_secs(8), &[], 0);
                 emit(&mut out, "AT+COPS?", &r);
+                // `+COPS: <mode>,<format>,"<oper>",<act>` — the numeric code
+                // and the AcT are what a client needs; the human-readable
+                // operator name is a lookup on the code, not another query.
+                let fields = cops_fields(&r);
+                let field = |i: usize| -> String {
+                    fields
+                        .as_ref()
+                        .and_then(|f| f.get(i))
+                        .map(|v| v.trim().trim_matches('"').to_string())
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| "-".to_string())
+                };
+                out.push(format!("operator_numeric: {}", field(2)));
+                out.push(format!("operator_act: {}", field(3)));
                 ok = r.ok();
             }
             "scan" => {
@@ -408,11 +504,18 @@ impl Capability for Sms {
             // of these, not by the send itself.
             "status" => {
                 let mut ok = true;
+                let mut smsc: Option<String> = None;
                 for cmd in ["AT+CMGF?", "AT+CSMS?", "AT+CPMS?", "AT+CSCA?", "AT+CSCS?", "AT+CNMI?"] {
                     let r = session.command(cmd, Duration::from_secs(8), &[], 0);
                     emit(&mut out, cmd, &r);
+                    if cmd == "AT+CSCA?" {
+                        // The stored value may be hex-of-ASCII (the RIL writes it
+                        // under CSCS="HEX"); the summary names the number itself.
+                        smsc = r.first_with_prefix("+CSCA:").and_then(smsc_from_answer);
+                    }
                     ok &= r.ok();
                 }
+                out.push(format!("smsc: {}", smsc.as_deref().unwrap_or("-")));
                 return Ok(outcome(out, ok));
             }
             // Re-set the service-centre address.  Measured on the device: the

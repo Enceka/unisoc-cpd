@@ -189,6 +189,16 @@ fn respond(w: &mut File, cmd: &str, urcs: &AtomicU64, state: &mut ModemState) {
     let upper = cmd.to_ascii_uppercase();
     let body: String = if upper == "AT" {
         "OK\r\n".into()
+    } else if upper.starts_with("AT+CGMM") {
+        // Placeholder identity: the rig must never carry a real CP model or
+        // firmware revision, for the same reason tests carry no real IMEI.
+        "FAKE-CP-MODEL\r\nOK\r\n".into()
+    } else if upper.starts_with("AT+CGMR") {
+        "FAKE-FW-0.0.1\r\nOK\r\n".into()
+    } else if upper == "ATI" {
+        "FAKE-CP-MODEL\r\nRevision: FAKE-FW-0.0.1\r\nOK\r\n".into()
+    } else if upper.starts_with("AT+CNUM") {
+        "+CNUM: \"\",\"+8613800138000\",145\r\nOK\r\n".into()
     } else if upper.starts_with("AT+CSQ") {
         "+CSQ: 23,99\r\nOK\r\n".into()
     } else if upper.starts_with("AT+CESQ") {

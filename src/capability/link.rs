@@ -6,7 +6,7 @@
 //! seconds and it is still the same measurement, which is what makes it a rig
 //! rather than an anecdote.
 
-use super::{flag_value, Capability, Outcome};
+use super::{emit, flag_value, positionals, Capability, Outcome};
 use crate::context::Context;
 use crate::probes;
 use anyhow::Result;
@@ -20,7 +20,7 @@ impl Capability for Link {
     }
 
     fn summary(&self) -> &'static str {
-        "own the AT/URC channels, probe on a cadence, count CP asserts, URC gaps and mailbox IRQs"
+        "own the AT/URC channels and probe on a cadence, or `link info` to read the baseband identity"
     }
 
     fn native_only(&self) -> bool {
@@ -28,6 +28,14 @@ impl Capability for Link {
     }
 
     fn run(&self, ctx: &mut Context, args: &[String]) -> Result<Outcome> {
+        // `link info` is the same channel ownership with a different question:
+        // who is this CP, and what firmware is on it.  It is an action rather
+        // than a capability because it is the link's own identity, and because
+        // the web UI's baseband bar wants it from the process that already
+        // holds the port.
+        if positionals(args).first().map(|s| s.as_str()) == Some("info") {
+            return link_info(ctx);
+        }
         let seconds: f64 = flag_value(args, "--seconds")
             .unwrap_or("10")
             .parse()
@@ -149,4 +157,57 @@ impl Capability for Link {
         };
         Ok(outcome)
     }
+}
+
+/// What the CP says it is, in one round of read-only queries.
+///
+/// The three `key: value` lines at the end are the daemon's own answer in a
+/// shape a client can read without re-parsing AT framing — the same convention
+/// `sim identity`, `band status` and the rest use for the web UI.  A modem
+/// that answers nothing prints `-`, which is "not reported", never a guessed
+/// value: this is the W5 rule applied to an identity read.
+fn link_info(ctx: &mut Context) -> Result<Outcome> {
+    let session = ctx.at()?;
+    let t = Duration::from_secs(8);
+    let mut out = Vec::new();
+
+    let model = session.command("AT+CGMM", t, &[], 0);
+    let firmware = session.command("AT+CGMR", t, &[], 0);
+    let info = session.command("ATI", t, &[], 0);
+    for (cmd, reply) in [("AT+CGMM", &model), ("AT+CGMR", &firmware), ("ATI", &info)] {
+        emit(&mut out, cmd, reply);
+    }
+
+    let value = |reply: &crate::at::Reply| -> String {
+        let lines: Vec<&str> = reply
+            .lines
+            .iter()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect();
+        if lines.is_empty() {
+            "-".to_string()
+        } else {
+            lines.join(" | ")
+        }
+    };
+    out.push(format!(
+        "profile: {} ({})",
+        ctx.profile.name, ctx.profile.generation
+    ));
+    out.push(format!("model: {}", value(&model)));
+    out.push(format!("firmware: {}", value(&firmware)));
+    out.push(format!("revision: {}", value(&info)));
+
+    // The two commands that name the CP are the pass condition; `ATI` is
+    // informational and some firmware answers ERROR to it.
+    let ok = model.ok() && firmware.ok();
+    if !ok {
+        ctx.note("the CP did not answer its own identity commands".to_string());
+    }
+    Ok(if ok {
+        Outcome::pass(out)
+    } else {
+        Outcome::fail(out)
+    })
 }

@@ -236,6 +236,7 @@ impl Capability for Data {
             "status" => {
                 let session = ctx.at()?;
                 let mut out = Vec::new();
+                let mut rdp: Option<crate::at::Reply> = None;
                 for cmd in [
                     "AT+CEREG?".to_string(),
                     "AT+CGATT?".to_string(),
@@ -244,7 +245,42 @@ impl Capability for Data {
                 ] {
                     let r = session.command(&cmd, Duration::from_secs(8), &[], 0);
                     emit(&mut out, &cmd, &r);
+                    if cmd.starts_with("AT+CGCONTRDP") {
+                        rdp = Some(r);
+                    }
                 }
+                // The address the modem handed out, as a summary line: the
+                // interface listing below is what the host thinks, this is
+                // what the network said, and a client wants both told apart.
+                let context = rdp
+                    .as_ref()
+                    .and_then(|r| r.first_with_prefix("+CGCONTRDP:"))
+                    .and_then(parse_cgcontrdp);
+                let dash = || "-".to_string();
+                out.push(format!(
+                    "ip: {}",
+                    context
+                        .as_ref()
+                        .and_then(|c| c.address)
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(dash)
+                ));
+                out.push(format!(
+                    "apn: {}",
+                    context
+                        .as_ref()
+                        .map(|c| c.apn.clone())
+                        .filter(|a| !a.is_empty())
+                        .unwrap_or_else(dash)
+                ));
+                out.push(format!(
+                    "dns: {}",
+                    context
+                        .as_ref()
+                        .map(|c| c.dns.join(","))
+                        .filter(|d| !d.is_empty())
+                        .unwrap_or_else(dash)
+                ));
                 if let Some(iface) = &iface {
                     let (_, addr) = run("ip", &["-br", "addr", "show", iface]);
                     out.push(format!("interface {iface}: {addr}"));

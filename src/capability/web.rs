@@ -121,6 +121,9 @@ fn route(stream: &mut TcpStream, method: &str, path: &str, body: &str, socket: &
             });
             respond_json(stream, &answer);
         }
+        ("GET", "/api/info") => respond_json(stream, &api_info(socket)),
+        ("GET", "/api/identity") => respond_json(stream, &api_identity(socket)),
+        ("GET", "/api/network") => respond_json(stream, &api_network(socket)),
         ("POST", "/api/at") => {
             // The console is a thin front-end over the daemon's own `at`
             // capability: the command is parsed and sent by the process that
@@ -159,6 +162,206 @@ fn pass(stream: &mut TcpStream, socket: &Path, request: &Value) {
     let answer = ask(socket, request).unwrap_or_else(|e| json!({ "error": format!("{e}") }));
     respond_json(stream, &answer);
 }
+
+// ------------------------------------------------------- the information panels
+
+/// A capability's output lines, out of the daemon's JSON answer.
+fn output_lines(answer: &Value) -> Vec<String> {
+    answer
+        .get("output")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One `key: value` summary line a capability emitted, or `None`.
+///
+/// The convention the capabilities follow: after the raw AT echo (which is
+/// indented, and prefixed `> CMD`), a capability that has data for a client
+/// appends `key: value` lines at column zero.  Reading those is reading the
+/// daemon's own answer — not re-parsing AT framing, which would make this
+/// process a second, silent AT decoder.
+///
+/// `-` is the capabilities' "the modem did not report this", and is `None`
+/// here for the same reason `decode_cesq` refuses to turn 255 into a number:
+/// "absent" must not be rendered as a value.
+fn summary(output: &[String], key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    output.iter().find_map(|line| {
+        if line.starts_with(' ') || line.starts_with('>') {
+            return None;
+        }
+        line.strip_prefix(prefix.as_str())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty() && v != "-")
+    })
+}
+
+/// `imei0 (SIM 1, item 5e81) = <15 digits>` — or the read's own error, which is
+/// a fact about the device and is passed through rather than hidden.
+fn imei_entries(output: &[String]) -> Vec<Value> {
+    let mut entries = Vec::new();
+    for line in output {
+        let Some(rest) = line.strip_prefix("imei") else {
+            continue;
+        };
+        let Some((index, tail)) = rest.split_once(' ') else {
+            continue;
+        };
+        let Ok(index) = index.parse::<u32>() else {
+            continue;
+        };
+        let slot = tail
+            .split_once('(')
+            .and_then(|(_, r)| r.split_once(','))
+            .map(|(s, _)| s.trim().to_string());
+        let (value, detail) = match tail.split_once(" = ") {
+            Some((_, v)) => (
+                v.trim()
+                    .split_whitespace()
+                    .next()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.to_string()),
+                None,
+            ),
+            None => (None, tail.split_once(": ").map(|(_, d)| d.trim().to_string())),
+        };
+        let luhn = value.as_deref().map(crate::identity::luhn_valid);
+        entries.push(json!({
+            "index": index,
+            "slot": slot,
+            "value": value,
+            "luhn": luhn,
+            "detail": detail,
+        }));
+    }
+    entries
+}
+
+/// A field of a `+CEREG`-style summary: `n,stat,"tac","ci",act`.
+fn reg_field(value: Option<&String>, index: usize) -> Option<String> {
+    value?
+        .split(',')
+        .nth(index)
+        .map(|f| f.trim().trim_matches('"').to_string())
+        .filter(|f| !f.is_empty())
+}
+
+fn reg_state(value: Option<&String>) -> Option<i32> {
+    reg_field(value, 1)?.parse().ok()
+}
+
+/// The baseband bar: who the CP is, out of `link info`.
+fn api_info(socket: &Path) -> Value {
+    let answer = run_cap(socket, "link", &["info"]);
+    let out = output_lines(&answer);
+    json!({
+        "profile": summary(&out, "profile"),
+        "model": summary(&out, "model"),
+        "firmware": summary(&out, "firmware"),
+        "revision": summary(&out, "revision"),
+        "status": answer.get("status"),
+        "error": answer.get("error"),
+    })
+}
+
+/// The advanced panel: SIM and device identity, the bearer's address, and the
+/// service-centre address.  Each part fails on its own, because one absent
+/// fact (a card with no MSISDN, a diag node that is not up) must not blank the
+/// rest of the panel.
+fn api_identity(socket: &Path) -> Value {
+    let sim = run_cap(socket, "sim", &["identity"]);
+    let sim_out = output_lines(&sim);
+    let imei = run_cap(socket, "imei", &["read"]);
+    let data = run_cap(socket, "data", &["status"]);
+    let data_out = output_lines(&data);
+    let sms = run_cap(socket, "sms", &["status"]);
+    let sms_out = output_lines(&sms);
+
+    let mut errors = Vec::new();
+    for (what, answer) in [
+        ("sim identity", &sim),
+        ("imei read", &imei),
+        ("data status", &data),
+        ("sms status", &sms),
+    ] {
+        if let Some(e) = answer.get("error").and_then(|v| v.as_str()) {
+            errors.push(format!("{what}: {e}"));
+        } else if answer.get("status").and_then(|v| v.as_str()) == Some("fail") {
+            errors.push(format!("{what}: the daemon reported a failure"));
+        }
+    }
+
+    json!({
+        "iccid": summary(&sim_out, "iccid"),
+        "imsi": summary(&sim_out, "imsi"),
+        "phone": summary(&sim_out, "phone"),
+        "imei": imei_entries(&output_lines(&imei)),
+        "ip": summary(&data_out, "ip"),
+        "apn": summary(&data_out, "apn"),
+        "dns": summary(&data_out, "dns"),
+        "smsc": summary(&sms_out, "smsc"),
+        "errors": errors,
+    })
+}
+
+/// The network panel: the operator, and which generation the UE is actually
+/// registered on.  "SA" is claimed only on the evidence `+C5GREG` carries --
+/// the same gate `nr status` and the Android-side helper use.
+fn api_network(socket: &Path) -> Value {
+    let reg = run_cap(socket, "register", &["status"]);
+    let reg_out = output_lines(&reg);
+    let ops = run_cap(socket, "operator", &["status"]);
+    let ops_out = output_lines(&ops);
+
+    let cereg = summary(&reg_out, "cereg");
+    let c5greg = summary(&reg_out, "c5greg");
+    let creg = summary(&reg_out, "creg");
+    let gatt = summary(&reg_out, "gatt");
+
+    let registered = |v: Option<&String>| matches!(reg_state(v), Some(1) | Some(5));
+    let sa = registered(c5greg.as_ref());
+    let ps = registered(cereg.as_ref());
+    let act: Option<i32> = reg_field(cereg.as_ref(), 4).and_then(|a| a.parse().ok());
+    let mode = if sa {
+        "5G SA"
+    } else if ps {
+        match act {
+            Some(7) => "4G LTE",
+            Some(11) | Some(13) => "5G NSA",
+            Some(10) | Some(12) => "5G",
+            _ => "已注册",
+        }
+    } else {
+        "无服务"
+    };
+
+    let numeric = summary(&ops_out, "operator_numeric");
+    let name = numeric
+        .as_deref()
+        .and_then(crate::capability::control::operator_name)
+        .map(|s| s.to_string());
+
+    json!({
+        "operator_numeric": numeric,
+        "operator_name": name,
+        "operator_act": summary(&ops_out, "operator_act"),
+        "cereg": cereg,
+        "creg": creg,
+        "c5greg": c5greg,
+        "gatt": gatt,
+        "registered": ps || sa,
+        "sa": sa,
+        "mode": mode,
+        "error": reg.get("error").or_else(|| ops.get("error")),
+    })
+}
+
 
 fn respond_json(stream: &mut TcpStream, value: &Value) {
     respond(stream, "200 OK", "application/json", value.to_string());
@@ -229,14 +432,25 @@ const PAGE: &str = r#"<!doctype html>
  details{border:1px solid #333;border-radius:6px;margin:8px 0;padding:6px 8px;background:#161616}
  summary{cursor:pointer;font-weight:600;font-size:14px}
  .kv{font-size:13px;line-height:1.7} .kv b{color:#9cc79c;font-weight:600;display:inline-block;min-width:74px}
+ .kv .dim{opacity:.55}
+ .err{color:#f0b8b8;font-size:12px}
  .hist{font-size:12px;color:#888;cursor:pointer}
  .hist:hover{color:#ddd}
 </style></head><body>
 <h1>unisoc-cpd</h1>
+<div class="kv" id="baseband">…</div>
 <div class="chips" id="radio">…</div>
 <div class="chips" id="chips"></div>
 <div id="banner"><div id="bnr-txt" style="font-size:24px">+CRING: VOICE</div>
  <button onclick="act('answer')">接听</button><button class="red" onclick="act('hangup')">挂断</button></div>
+
+<details id="d-identity"><summary>高级信息（ICCID / IMEI / IMSI / IP / 手机号 / SMSC）</summary>
+<button onclick="loadIdentity()">刷新</button>
+<div class="kv" id="identity">展开后读取…</div></details>
+
+<details id="d-network"><summary>网络（运营商 · 5G SA/NSA · 注册状态）</summary>
+<button onclick="loadNetwork()">刷新</button>
+<div class="kv" id="network">展开后读取…</div></details>
 
 <h2>短信 · inbox</h2><div id="msgs">…</div>
 <h2>发短信</h2>
@@ -337,6 +551,39 @@ async function dial(){ const r = await post('/api/dial', {number:document.getEle
 async function act(w){ const r = await post('/api/'+w, {}); out('call-out', r);
  if(w!=='hangup') setTimeout(function(){document.getElementById('banner').style.display='none';}, 800); }
 
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+function kv(label, value){
+  return '<div><b>'+label+'</b>'+(value==null||value===''
+    ? '<span class="dim">未上报</span>' : esc(value))+'</div>'; }
+async function refreshInfo(){ try{ const d = await get('/api/info');
+  document.getElementById('baseband').innerHTML =
+    kv('基带', (d.model||'—') + ' · ' + (d.firmware||'—') + ' · ' + (d.profile||'—')); }catch(e){} }
+async function loadIdentity(){
+  const el = document.getElementById('identity'); el.textContent = '读取中…';
+  try{ const d = await get('/api/identity'); let h = '';
+    h += kv('ICCID', d.iccid); h += kv('IMSI', d.imsi); h += kv('手机号', d.phone);
+    (d.imei||[]).forEach(function(e){
+      h += kv('IMEI' + e.index + ' (' + (e.slot||'') + ')',
+              e.value ? (e.value + (e.luhn===false ? '  ⚠ Luhn 校验不过' : '')) : (e.detail||'读取失败')); });
+    h += kv('IP', d.ip); h += kv('APN', d.apn); h += kv('DNS', d.dns); h += kv('SMSC', d.smsc);
+    (d.errors||[]).forEach(function(x){ h += '<div class="err">'+esc(x)+'</div>'; });
+    el.innerHTML = h;
+  }catch(e){ el.textContent = '读取失败: '+e; } }
+async function loadNetwork(){
+  const el = document.getElementById('network'); el.textContent = '读取中…';
+  try{ const d = await get('/api/network'); let h = '';
+    h += kv('运营商', ((d.operator_name||'未知') + (d.operator_numeric ? ' · ' + d.operator_numeric : '')));
+    h += kv('网络', d.mode + (d.sa ? '（SA 已注册）' : ''));
+    h += kv('CEREG', d.cereg); h += kv('C5GREG', d.c5greg);
+    h += kv('CREG', d.creg); h += kv('GATT', d.gatt);
+    if(d.error) h += '<div class="err">'+esc(d.error)+'</div>';
+    el.innerHTML = h;
+  }catch(e){ el.textContent = '读取失败: '+e; } }
+function lazyLoad(){
+  document.getElementById('d-identity').addEventListener('toggle', function(){ if(this.open) loadIdentity(); });
+  document.getElementById('d-network').addEventListener('toggle', function(){ if(this.open) loadNetwork(); });
+}
+
 var atHist = [];
 try { atHist = JSON.parse(localStorage.getItem('atHist') || '[]') || []; } catch(e) { atHist = []; }
 function renderAtHist(){
@@ -361,8 +608,8 @@ function atEnter(e){ if(e.key==='Enter') sendAt(); }
 document.getElementById('at-cmd').addEventListener('keydown', atEnter);
 renderAtHist();
 setInterval(refreshState, 5000); setInterval(refreshUrc, 2000); setInterval(refreshMsgs, 8000);
-setInterval(refreshStatus, 20000);
-refreshState(); refreshUrc(); refreshMsgs(); refreshStatus();
+setInterval(refreshStatus, 20000); setInterval(refreshInfo, 60000);
+refreshState(); refreshUrc(); refreshMsgs(); refreshStatus(); refreshInfo(); lazyLoad();
 </script></body></html>
 
 "#;
@@ -382,5 +629,76 @@ mod tests {
     fn form_value_picks_named_fields() {
         assert_eq!(form_value("to=123&text=hello", "text"), Some("hello".into()));
         assert_eq!(form_value("to=123", "text"), None);
+    }
+
+    fn lines(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The summary convention: column-zero `key: value` only.  The raw echo is
+    /// indented and prefixed `> CMD`, so it can never be mistaken for data —
+    /// and `-` is absence, not a value.
+    #[test]
+    fn summaries_read_only_the_column_zero_lines() {
+        let out = lines(&[
+            "> AT+CIMI",
+            "  460011234567890",
+            "  OK",
+            "imsi: 460011234567890",
+            "iccid: 8986012345678901234",
+            "phone: -",
+            "  -> imsi: this is inside a block, not a summary",
+        ]);
+        assert_eq!(summary(&out, "imsi").as_deref(), Some("460011234567890"));
+        assert_eq!(
+            summary(&out, "iccid").as_deref(),
+            Some("8986012345678901234")
+        );
+        assert_eq!(summary(&out, "phone"), None);
+        assert_eq!(summary(&out, "nope"), None);
+    }
+
+    /// The two shapes `imei read` produces: a value, and the read's own error.
+    /// The second must survive into the panel — "the diag node is missing" is
+    /// a fact, not an empty field.
+    #[test]
+    fn imei_entries_keep_the_value_and_the_failure() {
+        let out = lines(&[
+            "imei0 (SIM 1, item 5e81) = 490154203237518",
+            "imei1 (SIM 2, item 5e82): no 15-digit identity record after the marker",
+            "some other line",
+        ]);
+        let entries = imei_entries(&out);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["index"], 0);
+        assert_eq!(entries[0]["slot"], "SIM 1");
+        assert_eq!(entries[0]["value"], "490154203237518");
+        assert_eq!(entries[0]["luhn"], true);
+        assert_eq!(entries[1]["index"], 1);
+        assert!(entries[1]["value"].is_null());
+        assert!(entries[1]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no 15-digit identity"));
+    }
+
+    /// A check-digit failure is reported, not silently rounded away.
+    #[test]
+    fn a_luhn_invalid_imei_is_flagged() {
+        let out = lines(&["imei0 (SIM 1, item 5e81) = 490154203237519"]);
+        assert_eq!(imei_entries(&out)[0]["luhn"], false);
+    }
+
+    #[test]
+    fn registration_fields_are_read_by_position() {
+        let cereg = Some("2,1,\"DE0400\",\"005BE001\",7".to_string());
+        assert_eq!(reg_state(cereg.as_ref()), Some(1));
+        assert_eq!(reg_field(cereg.as_ref(), 4).as_deref(), Some("7"));
+        assert_eq!(
+            reg_field(cereg.as_ref(), 2).as_deref(),
+            Some("DE0400"),
+            "a quoted field loses its quotes"
+        );
+        assert_eq!(reg_state(Some(&"-".to_string())), None);
     }
 }
