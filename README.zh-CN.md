@@ -1,205 +1,107 @@
-# unisoc-cpd 中文文档
+# unisoc-cpd
 
-面向 Unisoc CP（基带）的设备无关控制守护进程。设计依据是 [`BASEBAND-PLAN.md`](BASEBAND-PLAN.md)。
+面向 Unisoc CP（基带）的设备无关控制守护进程，依据 [`BASEBAND-PLAN.md`](BASEBAND-PLAN.md) 实现。
 
-> 英文版见 [`README.md`](README.md)，接口契约见 [`docs/BASEBAND-CONTRACTS.md`](docs/BASEBAND-CONTRACTS.md)。
+> English: [`README.md`](README.md)
 
----
-
-## 1. 这是什么
-
-一句话：**一个二进制，靠一份 profile 驱动一颗 Unisoc CP。**
-
-核心判断是：AP 侧看到的契约属于**基带代次**，而不是主板。SIPC 通道编号、AT/URC 方言、CP 启动握手、日志/转储通道、时间同步通道、mailbox 的脾气——这些在同一代 CP 上不管焊到哪块板子都一样。所以：
-
-* `core/`（核心）**永远不出现任何板级名字**；
-* 一块板子知道的一切——设备节点、分区、网卡名、spool 通道、厂商命令——全部写在 `platform/profiles/<平台>.toml` 里。
-
-这条边界不是靠自觉，而是靠命令检查：`unisoc-cpd profile-check` 会把每个 profile 允许知道的名字拿去搜 `src/`，一旦核心代码里出现就判失败。
-
-## 2. 目录结构
+AP 侧所面对的接口契约由**基带代次**决定，而非由主板决定：SIPC 通道、AT/URC
+方言、CP 启动握手、日志/转储 spool、时间同步通道以及 mailbox 的行为特性，在同一代
+CP 上与所在板卡无关。因此本项目的核心代码不出现任何平台名称。板级信息——设备节点、
+分区、网卡名、spool 通道、厂商命令——全部位于 `platform/profiles/` 下的 profile 中；
+一旦这一边界被越过，`unisoc-cpd profile-check` 即判定失败。
 
 ```
-unisoc-cpd / ucpd              一个二进制，一份 profile
-├── src/channel.rs             通道层：独占持有、持续排空、健康计数
+unisoc-cpd                     单一二进制，由一份 profile 驱动
+├── src/channel.rs             独占持有通道，持续排空，并统计所见数据
 ├── src/at.rs                  AT 编解码、URC 分流、串行化、限速、超时
-├── src/urc.rs                 URC 解码：控制面的主动一半（MT 短信/来电/注册/信号）
-├── src/unisoc_at.rs           本代 CP 自己的 AT 扩展（频段/小区/5G/IMS）
-├── src/nat.rs                 承载的主机侧：规则/计划构建与只读回验（纯逻辑，全部可单测）
-├── src/capability/            各项能力（见第 6 节）；serve 是常驻持有者
-├── src/telemetry.rs           每次运行的 JSON 摘要
-├── src/profile_check.rs       A12 可移植性门禁（做成命令）
-├── platform/profiles/e5.toml     唯一知道 E5 的文件
-├── platform/profiles/mu300.toml  第二个平台，同一核心（桩，未验证）
-├── units/                     systemd 单元：浸泡（timer）+ 常驻持有者
-├── tools/build-aarch64.sh     交叉编译脚本
-├── docs/BASEBAND-CONTRACTS.md 通道/命令/时序契约（§9 是 G2 的控制面契约）
-└── docs/FINDINGS.md           本仓库自己实测得出的结论，逐条编号
+├── src/urc.rs                 URC 解码：控制面中由 CP 主动上报的部分
+├── src/unisoc_at.rs           本代 CP 的专有 AT 扩展（频段/小区/5G/IMS）
+├── src/nat.rs                 承载的主机侧：规则与执行计划的生成、回读校验
+├── src/capability/            link、sim、cfun、register、signal、operator、
+│                              band、nr、ims、sms、ussd、call、data、nv、diag、serve
+├── src/telemetry.rs           每次运行的 JSON 摘要：assert、URC 间隔、mailbox 增量、计数器
+├── src/profile_check.rs       A12 门禁，以命令形式提供
+├── platform/profiles/e5.toml      唯一包含 E5 信息的文件
+├── platform/profiles/mu300.toml   第二个平台，共用同一核心（桩，未验证）
+├── docs/BASEBAND-CONTRACTS.md     W0：通道、命令与时序契约（§9：G2）
+└── docs/FINDINGS.md               实测结论，逐条编号
 ```
 
-## 3. 构建与测试
+## 构建
 
 ```sh
-cargo build --release        # 主机
-cargo test                   # 172 个测试，不需要设备
+cargo build --release          # 主机
+cargo test                     # 172 个测试，无需设备
 ```
 
-测试跑在一个 **pty 上的伪 CP** 上。pty 是 SIPC tty 唯一诚实的替身：真 tty、两端、驱动按突发交付行。伪 CP 会在**每一条应答里插入一条 URC**，所以"URC 与应答分流"、"限速"、"超时"、`>` 续行提示符这四条路径**每条命令都会被走到**，而不是只在顺利路径上被走到。
+测试针对运行在 **pty** 上的模拟 CP 执行。pty 是 SIPC tty 唯一可信的替身：它是真实的
+双端 tty，驱动按突发方式交付数据行，模拟的调制解调器在每条应答中插入 URC——因此
+应答/URC 分流、限速、超时以及 `>` 续行提示符在每一条命令上都会被覆盖，而不仅限于
+正常路径。
 
-交叉编译到设备（Debian trixie arm64）：
+设备端（Debian trixie arm64）的构建见 `tools/build-aarch64.sh`。可靠的交叉编译目标是
+`aarch64-unknown-linux-musl`：静态二进制不依赖目标系统的 glibc 版本，这也是对计划中
+“同一二进制，第二个平台”的最直接实现。该脚本即完整的构建流程，其中一个不直观的步骤是
+链接器必须使用 `rust-lld` 而非主机的 GNU ld，因为 `--fix-cortex-a53-843419` 是主机 ld
+不接受的 AArch64 选项。
+
+## 运行
+
+```
+unisoc-cpd [--profile NAME] [--mode native|vendor] <capability> [args]
+unisoc-cpd mode native <capability>      # 测试台使用的写法
+unisoc-cpd capabilities                  # 列出支持的能力
+unisoc-cpd profiles                      # 列出已知平台
+unisoc-cpd profile-check                 # A12 门禁
+```
+
+示例：
 
 ```sh
-rustup target add aarch64-unknown-linux-musl
-tools/build-aarch64.sh
+unisoc-cpd --profile e5 --mode native link --seconds 60      # CP 链路健康检查
+unisoc-cpd --profile e5 --mode native link --seconds 259200  # 72 小时浸泡测试（A1）
+unisoc-cpd --profile e5 --mode native sim
+unisoc-cpd --profile e5 --mode native band status
+unisoc-cpd --profile e5 --mode native band lock nr 78
+unisoc-cpd --profile e5 --mode native data up                 # 建立承载；[data.nat].enabled 时同时配置主机侧
+unisoc-cpd --profile e5 --mode native data nat status         # 路由、转发规则对、伪装规则——实测读回，而非推定
+unisoc-cpd --profile e5 --mode vendor register               # 厂商基线
+unisoc-cpd --profile e5 --mode native nv list                # 只读
+unisoc-cpd --socket /run/unisoc-cpd/cmd.sock web 0.0.0.0:7887  # W7：浏览器界面
 ```
 
-选 `aarch64-unknown-linux-musl` 是因为**静态链接的二进制不受对端 glibc 版本影响**——这也是计划里"同一个二进制、第二个平台"最干净的解释。脚本里唯一不显然的一步是链接器：musl 目标由 rustc 自己链入自带的 musl 目标文件，但它驱动的链接器仍须认得 AArch64 选项，而主机的 GNU ld 会拒绝 `--fix-cortex-a53-843419`（那是 lld 的选项），所以脚本把目标指向工具链自带的 `rust-lld`。
+`--mode vendor` 执行 profile 为该能力指定的厂商命令并记录其输出，从而可以用同一验收
+测试分别检验厂商守护进程与本项目，并对比两份摘要。`link` 与 `serve` 仅支持 native
+模式：通道持有情况的测量不存在可供对比的厂商实现。
 
-主机没有交叉工具链时，也可以在设备上本地编译（设备自带 rootfs 是 Debian arm64）：
+## 常驻持有者（G2）
 
-```sh
-tools/build-aarch64.sh --on-device 用户@主机
-```
-
-## 4. 命令行
-
-```
-unisoc-cpd [选项] <能力> [参数...]
-```
-
-| 选项 | 说明 |
-|---|---|
-| `--profile <名字\|路径>` | 指定 profile，省略时若目录下只有一个则自动选中 |
-| `--profiles-dir <目录>` | profile 所在目录（默认 `platform/profiles`） |
-| `--mode native\|vendor` | 默认 `native` |
-| `--runs-dir <目录>` | 运行摘要写入位置（默认 `./runs`） |
-| `--state-dir <目录>` | 通道独占锁位置（默认 `/run/unisoc-cpd`） |
-| `--socket <路径>` | 交给常驻守护进程：对其它能力是“去问它”，对 `serve` 是“在这里听” |
-| `--no-telemetry` | 不写运行摘要 |
-| `-v` | 详细输出 |
-
-计划里的测试台拼写 `unisoc-cpd mode vendor|native <能力>` 与 `--mode` 等价，两种都接受。
-
-三个不带 AT 的子命令：
-
-```sh
-unisoc-cpd capabilities     # 列出所有能力
-unisoc-cpd profiles         # 列出所有平台 profile
-unisoc-cpd profile-check    # 跑 A12 门禁，通过返回 0
-```
-
-### 常驻持有者（G2）
-
-`serve` 是 Android 那一侧 `urild` 坐的那个位置：开机独占两条通道、持续读
-URC、空闲时探活，并在 unix socket 上以 JSON 应答能力请求。**只允许一条 AT
-通道一个读者**，所以能力要么直连通道，要么问守护进程，不能两者并存：
+`serve` 承担 Android 中 RIL 的角色：开机时一次性接管通道并持续持有，不间断读取主动
+上报流，空闲时探测 CP，并通过 unix socket 响应能力请求。由于一条 AT 通道只能有一个
+读者，能力要么自行打开通道（未运行 `serve` 时），要么通过 `--socket` 请求守护进程，
+二者不可兼得：
 
 ```sh
 unisoc-cpd --profile e5 --mode native serve --socket /run/unisoc-cpd/cmd.sock
 
-# 另一个终端：通道已被守护进程持有，能力必须问它，而不是自己开通道
 unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock sim
-unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock register status
-unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock state   # 守护进程状态（含 last_ok_age_s）
-unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock urc     # 最近解码出的 URC 事件
-unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock messages # 守护进程自己读到的短信（MT）
-
-# 浏览器界面（W7）同样是 socket 客户端，挂在守护进程上
-unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock web 0.0.0.0:7887
+unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock state    # 守护进程自身状态
+unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock urc      # 已解码的 URC 事件
+unisoc-cpd --mode native --socket /run/unisoc-cpd/cmd.sock messages # 守护进程自行读取的短信（MT）
 ```
 
-`serve` 会自己对 `+CMTI:` 起反应：modem 一宣布新短信，守护进程就在两个请求
-之间用 `AT+CMGR` 把它读出来（只读，不删；PDU 模式不解码、明说），客户端用
-`messages` 随时取。发短信走 `sms send <号码> <正文>`（MO 路径，`AT+CMGS` 的
-`>` 续行提示符在 AT 层处理）。
+`serve` 会自行处理 `+CMTI:`：调制解调器通告新短信后，守护进程在两次请求之间以
+`AT+CMGR` 读取（只读，从不删除；PDU 模式不解码，并如实标注），客户端通过 `messages`
+获取结果。发送使用 `sms send <号码> <正文>`（MO 路径，其 `>` 续行提示符由 AT 层处理）。
 
-契约（URC→事件表、请求/应答、哪些是有意不做的）在
-[`docs/BASEBAND-CONTRACTS.md`](docs/BASEBAND-CONTRACTS.md) §9。
+请求的对象始终是**能力**，而非原始 AT 字符串：经 socket 转发原始 AT 会使“单一读者”
+规则脱离唯一负责执行它的进程。契约——URC 到事件的映射表、请求/响应格式，以及有意
+暂不实现的部分——见 `docs/BASEBAND-CONTRACTS.md` §9。
 
-### 两种模式
+## 遥测
 
-* **`native`**：我们持有通道、我们驱动调制解调器。
-* **`vendor`**：仍然让厂商守护进程干活，我们只执行 profile 里为该能力配置的命令并记录它的输出。
-
-同一个验收用例在两种模式下都要跑通，厂商那一侧才能关掉——所以两种模式写出的摘要是**可以直接对比**的。
-
-**退出码**：`0` 通过 ／ `1` 失败 ／ `2` 用法或配置错误 ／ `3` 环境问题（通道被他人占用、设备打不开）。
-
-## 5. 唯一红线
-
-代码里强制执行，不是约定：
-
-1. **一条 AT 通道绝不出现两个读者。** 每个 AT 通道加独占 `flock`；第二个实例会**明确失败并返回退出码 3**，而不是静默地抢走一半数据。之所以是红线：SIPC 通道对没人读的内容是**排队**的，第二个读者不会报错，只会让两边都拿不到完整应答。
-
-身份（IMEI）与 NV 的写入不在红线之列：它们走的是受护栏的路径（`imei read`/`probe`/`write`、`nv backup`/`restore`，见契约文档第 8 节）——profile 显式开启、备份先行、写后回读，而不是一纸禁令。
-
-## 6. 能力一览
-
-| 能力 | 用途 | 子命令 |
-|---|---|---|
-| `link` | **W1 门禁**：独占 AT/URC 通道、按节奏探活、统计 CP assert / URC 间隔 / mailbox 中断增量 | `--seconds N`（默认 10）`--interval S`（默认 30）`--timeout S`（默认 5）`--probe 命令`（默认 `AT`）。72 小时浸泡就是 `--seconds 259200` |
-| `sim` | SIM 在位与 PIN 状态 | 无参＝查询；`<PIN>`＝解锁；`identity`＝读 IMSI/ICCID（只读） |
-| `cfun` | 射频开关 | `status` `on` `off` `reset` `cycling`（后者会把 SIM 弄丢到重启，故返回失败并注明） |
-| `register` | 电路/分组注册、UE 用途设置 | `status`（含 `+C5GREG?`）`uemode` `data-centric` `voice-centric` |
-| `signal` | 信号质量测量 | 无参；`+CSQ` 与 `+CESQ` 均解码，含 NR SA 扩展字段（SS-RSRP/RSRQ/SINR）。RSSI 按 CSQ 索引换算 dBm（`-113+2n`），索引 99＝未上报，如实呈现 |
-| `operator` | 选网 | `status` `scan` `auto` `manual <MCCMNC>` |
-| `band` | **频段锁定与小区锁定** | `status` `lock <lte\|nr> <频段...>` `unlock <lte\|nr\|all>` `cell-lock <lte\|nr> <频点> <PCI>` `cell-unlock <lte\|nr\|all>` |
-| `nr` | 5G SA/NSA 偏好与 5G 注册 | `status` `sa on` `sa off` |
-| `ims` | VoLTE/VoNR 探测与开关（计划 W5：能用就说能用） | `status` `volte on\|off` `vonr on\|off` |
-| `sms` | 短信 | `list` `read <序号>` `delete <序号\|all>` `send <号码> <正文>` |
-| `ussd` | USSD 会话 | `<业务码>`；无参＝取消会话 |
-| `call` | 语音 CS 控制 | `list` `dial <号码>` `answer` `hangup` `dtmf <按键>` |
-| `data` | PDP 上下文与承载网卡 | `status` `up [APN]` `down` `apn` `contexts` `set-apn <APN>` `clear-apn` `save-apn <APN>` `nat on\|off\|status\|plan` |
-| `imei` | 设备身份（带护栏） | `read [--index N]` `probe` `write <串号> --index N --yes` |
-| `nv` | NV 视图与受护栏的备份/恢复 | `list` `hash <分区>` `[--head 字节数]` `backup [--dir D]` `restore <分区> <镜像> --yes` |
-| `diag` | 诊断 | `channels` `spools` `mailbox` `asserts` `urc` `all` |
-| `serve` | **G2**：常驻持有者，代替 Android 的 RIL 坐住通道 | `[--socket 路径]` `[--seconds N]`；客户端用 `--socket` + `<能力>`，或问它 `state` / `urc` / `messages` |
-| `web` | **W7**：浏览器界面，Material You，单文件、离线、零构建 | `web [地址:端口]`（须配 `--socket`）；收发短信、拨打/接听/挂断、实时 URC 流、来电横幅，以及高级信息 / APN / 信号指标 / 网络 / 锁频锁小区 / IMEI / 原始 AT 控制台面板 |
-
-写操作都会**回读校验**：`band lock` 写完立刻读回，没生效就不算通过——"调制解调器收下了命令"和"锁定真的生效了"是两回事。
-
-## 7. 常用示例
-
-```sh
-# 通道健康（十秒版；换 --seconds 259200 就是 72 小时浸泡）
-unisoc-cpd --profile e5 --mode native link --seconds 60
-
-# 控制面
-unisoc-cpd --profile e5 --mode native sim
-unisoc-cpd --profile e5 --mode native register status
-unisoc-cpd --profile e5 --mode native signal
-
-# 频段：先看，再锁，再确认读回
-unisoc-cpd --profile e5 --mode native band status
-unisoc-cpd --profile e5 --mode native band lock nr 78
-unisoc-cpd --profile e5 --mode native band unlock all
-
-# 承载（[data.nat].enabled 时，up 成功后自动装主机侧；down 自动撤）
-unisoc-cpd --profile e5 --mode native data up
-unisoc-cpd --profile e5 --mode native data status
-unisoc-cpd --profile e5 --mode native data nat status   # 把规则读回来验证，而不是声称装好了
-unisoc-cpd --profile e5 --mode native data nat plan     # 只打印将执行的命令，不执行
-
-# 厂商基线（做差分用）
-unisoc-cpd --profile e5 --mode vendor register
-
-# 只读排查：不碰 AT 通道
-unisoc-cpd --profile e5 --mode native diag spools
-unisoc-cpd --profile e5 --mode native nv list
-```
-
-## 8. 运行摘要（遥测）
-
-每次运行写 `runs/<平台>/<日期>/<能力>.<模式>.<时分秒>.json`，并把同一条记录追加到 `runs/<平台>/<日期>/summary.json`。这就是验收矩阵的机读形式——A1 的四个条件分别对应：
-
-| A1 要求 | 摘要里的字段 |
-|---|---|
-| 0 次 CP assert | `cp_asserts.delta` |
-| URC 间隔 < 5 s | `urc.max_gap_s` |
-| mailbox 中断计数增长 | `mailbox_irq.delta` |
-| 通道未重建（通道健康） | `channels.cmd.reopens` |
-
-样例：
+每次运行写入 `runs/<platform>/<date>/<capability>.<mode>.<hhmmss>.json`，并将同一条记录
+追加到 `runs/<platform>/<date>/summary.json`：
 
 ```json
 {
@@ -213,15 +115,13 @@ unisoc-cpd --profile e5 --mode native nv list
 }
 ```
 
-说明几点：
+这是验收矩阵的机器可读形式：A1 的四项条件分别对应 `cp_asserts.delta`、
+`urc.max_gap_s`、`mailbox_irq.delta` 与 `channels.cmd.reopens`。
 
-* `probes` 与 `commands` **分开计数**。前者回答"我们多久问一次 CP 还活着没有"，后者回答"我们往 CP 发了多少 AT"——只有前者允许驱动看门狗。
-* `mailbox_irq` / `cp_asserts` 在**测不到的平台上是 `null`**，而不是 0。该平台没有对应计数器时，宁可写"未测量"也不写"没有"。
-* 非请求行（URC）与应答行分开记账，`urc.tail` 会保留最近若干条原文，供事后取证。
+## 在 E5 上部署
 
-## 9. 部署到设备
-
-浸泡用 systemd timer，单元在 `units/`：
+浸泡测试以 systemd 定时器运行（`units/`），这同时满足计划中“看门狗重启不得掩盖证据”
+的要求：
 
 ```sh
 install -Dm755 target/aarch64-unknown-linux-musl/release/unisoc-cpd /usr/local/bin/unisoc-cpd
@@ -230,65 +130,93 @@ cp -r units/* /etc/systemd/system/ && systemctl daemon-reload
 systemctl enable --now unisoc-cpd-soak.timer
 ```
 
-**接管控制面**（G2）用常驻单元而不是浸泡 timer：它声明了对旧 AT 代理的
-`Conflicts=`，启动时由 systemd 替我们停掉它们——这正是“接管”而不是“并存”：
+接管控制面（G2）使用常驻单元而非浸泡定时器。该单元对现有 AT 代理声明了
+`Conflicts=`，由 systemd 负责停止它们——“接管”即指此，而非与之共存：
 
 ```sh
 systemctl enable --now unisoc-cpd.service
 ```
 
-**切换所有权前必须先停掉旧的 AT 代理**，否则本程序会（按设计）拒绝启动：
+现有的 shell 代理 `e5-atd` 运行期间持有 `/dev/stty_nr1`，此时 `unisoc-cpd` 会拒绝成为
+第二个读者，并以退出码 3 明确报错。请先停止厂商侧服务：
 
 ```sh
 systemctl stop e5-mobile-data-watch e5-mobile-data e5-atd
 ```
 
-`units/unisoc-cpd-soak.service` 和 `units/unisoc-cpd.service` 里都用 `Conflicts=`
-声明了这三个单元，但手动切换时要记得它们。
+## 状态
 
-## 10. 当前状态（不夸大）
-
-| 项目 | 状态 |
+| | |
 |---|---|
-| 核心（channel / at / telemetry / profile / CLI） | 已实现，172 个测试通过 |
-| `profile-check`（A12 门禁） | 通过（两个 profile，核心无平台名） |
-| URC 解码（契约 §9.2） | 已实现并测试；`+ECIND:`/`+CMT:`/`+CDS:` 有意保持原样，不解码就不假装解码 |
-| **G2 控制面（`serve`）** | 已实现并通过离线测试，**且已在真机常驻**（2026-09-20 起，Android 侧）：厂商 RIL 停止后独占两条通道，URC 解码 50/50，socket 客户端全部经它应答，0 次 CP assert，`state` 报告 `last_ok_age_s`。尚未完成：Linux 侧**开机即接管**（systemd 单元已在 `units/`，未在开机路径验证）、72 小时浸泡 |
-| aarch64 构建 | 静态 `aarch64-unknown-linux-musl`，`tools/build-aarch64.sh` 可复现 |
-| **真机只读验证** | ✅ 已做：`diag spools`（8 个节点，全部 `char`）、`diag mailbox`、`diag asserts`（0 次 assert）、`nv list`（7 个分区）。每次运行的摘要都显示 `at.commands: 0`、`channels.cmd.opens: 0`，即**全程没有打开过 AT 通道** |
-| **真机接管 AT** | ✅ **Android 侧已做**（2026-09-20）：`stop vendor.ril-daemon` 后守护进程成为两条通道的唯一读者，`link`/`sim`/`band`/`serve`+socket 全部实测通过，0 次 CP assert，URC 解码 50/50；交接规程与栈冷启动要求见 FINDINGS §1–§2。Linux 侧还没在开机时当过主人，没跑过浸泡，profile 仍 `verified = false` |
-| 信号测量 | `+CSQ` 与 `+CESQ` 均解码，含 NR SA 扩展字段（SS-RSRP/RSRQ/SINR）；RSSI 按 CSQ 索引换算 dBm，索引 99 如实报告为「未上报」而非编造数值 |
-| 承载的主机侧（`data nat`） | 已实现并**真机实测**（2026-09-21，Android 侧，见契约 §10）：`on` 一次装齐 8 步，重复执行不产生重复规则；`status` 把规则读回验证，输出 `nat: complete`；实测前两张路由表均无默认路由、`ping 223.5.5.5` 不通，实测后 2/2 回包。平台名（表/链/客户端网卡）全部来自 profile，客户端子网在运行时从网卡读取而非写死；Linux 侧自带的 `nat.nft` 不受影响 |
-| log/dump spool 排空、`stime_ch` | ❌ 未实现（W1 遗留） |
-| 语音 CS | 音频路由仍无（`voice.supported = false`）；信令一半已实测——`ims status` 读 `+CIREG`（IMS 注册门禁），`call` 纯信令拨/接/挂；**守护进程之下的第一通 VoLTE 来电已接通**（FINDINGS §14） |
-| W7 web 界面 | 已落地并按 Material You 重新设计（单文件、离线、零构建）：收件箱与删除、发送短信、拨打/接听/挂断、实时 URC 事件流、来电横幅，以及高级信息、APN、信号指标、网络、锁频锁小区、IMEI 与原始 AT 控制台面板——本质是 socket 客户端，绝不持有通道（`units/unisoc-cpd-web.service`） |
+| 核心（channel/at/telemetry/profile/CLI） | 已实现，172 个测试通过 |
+| 能力 | `link`、`sim`、`register`、`signal`、`operator`、`cfun`、`band`、`nr`、`ims`、`sms`、`ussd`、`call`、`data`、`nv`、`diag`、`serve`、`web` |
+| URC 解码（契约 §9.2） | 已实现并测试；`+ECIND:`/`+CMT:`/`+CDS:` 有意保留原文，不做不完整的解码 |
+| G2 控制面（`serve`） | 已实现并通过离线测试，并已**常驻于手机**：Android 侧（2026-09-20 起）在停止厂商 RIL 后，守护进程持续数小时持有两条通道——URC 流解码 50/50，socket 客户端（`sim`、`band`、`web`）均经其应答，0 次 CP assert，`state` 报告 `last_ok_age_s`；Linux 侧（e5-linux，2026-09-25 起）由 systemd 在**开机时**接管，`e5-bearer-up` 经其建立承载。待完成：72 小时浸泡 |
+| W0 契约 | `docs/BASEBAND-CONTRACTS.md`，本代 AT 扩展已完成调研并有单元测试 |
+| A12 `profile-check` | 通过（两个 profile，核心无平台名称） |
+| aarch64 构建 | 静态 `aarch64-unknown-linux-musl`，由 `tools/build-aarch64.sh` 构建 |
+| 真机只读验证 | 已在手机上验证：`diag spools`（8 个节点，均为 `char`）、`diag mailbox`、`diag asserts`（0 次 CP assert）、`nv list`（7 个分区）。每次运行的摘要均为 `at.commands: 0`、`channels.cmd.opens: 0`——厂商 RIL 持有 AT 通道期间有意不触碰该通道 |
+| 真机 AT | **Android 侧已实测**（2026-09-20）：`stop vendor.ril-daemon` 后守护进程成为两条通道的唯一读者——`link`、`sim`、`band`、`serve` 及 socket 客户端全部通过，0 次 CP assert，URC 解码 50/50；交接规程与协议栈冷启动要求见 FINDINGS §1–§2。**Linux 侧开机接管已运行**（2026-09-25 起，e5-linux）；尚未完成浸泡，尚无 profile 标记为 `verified` |
+| 信号测量 | `+CSQ` 与 `+CESQ` 均已解码，含 NR SA 扩展字段（SS-RSRP/RSRQ/SINR）；RSSI 由 CSQ 索引换算为 dBm（`-113 + 2·n`），索引 99 报告为未知，不换算为数值 |
+| log/dump spool 排空、`stime_ch` | 未实现（W1，待完成） |
+| 语音 | 尚无音频路由（`voice.supported = false`）；信令部分已实测——`ims status` 读取 `+CIREG`（IMS 注册门禁），`call` 仅在信令层完成拨号/接听/挂断；**守护进程下已接通第一通 MT VoLTE 来电**（FINDINGS §14） |
+| W7 web 界面 | `web` 通过 HTTP 提供守护进程的功能：收件箱与删除、发送短信、拨号/接听/挂断、实时 URC 流、来电横幅，以及高级信息、APN、信号指标、网络、频段/小区锁定、IMEI 与原始 AT 控制台面板——本身是 socket 客户端，从不持有通道（`units/unisoc-cpd-web.service`）。页面采用 Material You，单文件、可离线：无需构建，也不从网络加载样式表或字体（它可能是访问设备的唯一途径） |
+| 承载的主机侧（`data nat`） | 已实现并**在 Android 侧实测**（2026-09-21，RIL 已停止）：`on` 完成 8/8 步，再次执行 `on` 每条规则仍只有一份，`status` 读回为 `nat: complete`；实测前两张路由表均无默认路由，实测后 `ping 223.5.5.5` 应答 2/2（契约 §10）。Linux 侧自带的 `nat.nft` 不受影响 |
 
-## 11. AT 指令的来源
+## 附录 A：能力参考
 
-本代 CP 特有的那批指令（频段/小区锁定、5G SA/NSA、VoLTE/VoNR、UE 用途设置）是**通过研究这颗调制解调器自身的 AT 接口得到的**，不是来自厂商文档，也还没有发往真机。因此：
+| 能力 | 用途 | 子命令与参数 |
+|---|---|---|
+| `link` | W1 门禁：独占 AT/URC 通道，按固定间隔探测，统计 CP assert、URC 间隔与 mailbox 中断增量 | `--seconds N`（默认 10）、`--interval S`（默认 30）、`--timeout S`（默认 5）、`--probe 命令`（默认 `AT`）；72 小时浸泡为 `--seconds 259200` |
+| `sim` | SIM 在位与 PIN 状态 | 无参数为查询；`<PIN>` 解锁；`identity` 读取 IMSI/ICCID（只读） |
+| `cfun` | 射频功能 | `status`、`on`、`off`、`reset`、`cycling`（后者会使 SIM 丢失直至重启，因此返回失败并注明原因） |
+| `register` | 电路域/分组域注册与 UE 用途设置 | `status`（含 `+C5GREG?`）、`uemode`、`data-centric`、`voice-centric` |
+| `signal` | 信号质量 | 无参数；解码 `+CSQ` 与 `+CESQ`，含 NR SA 扩展字段 |
+| `operator` | 网络选择 | `status`、`scan`、`auto`、`manual <MCCMNC>` |
+| `band` | 频段锁定与小区锁定 | `status`、`lock <lte\|nr> <频段...>`、`unlock <lte\|nr\|all>`、`cell-lock <lte\|nr> <频点> <PCI>`、`cell-unlock <lte\|nr\|all>` |
+| `nr` | 5G SA/NSA 偏好与 5G 注册 | `status`、`sa on`、`sa off` |
+| `ims` | VoLTE/VoNR 探测与开关 | `status`、`volte on\|off`、`vonr on\|off` |
+| `sms` | 短信 | `list`、`read <序号>`、`delete <序号\|all>`、`send <号码> <正文>` |
+| `ussd` | USSD 会话 | `<业务码>`；无参数为取消会话 |
+| `call` | 语音呼叫控制 | `list`、`dial <号码>`、`answer`、`hangup`、`dtmf <按键>` |
+| `data` | PDP 上下文与承载网卡 | `status`、`up [APN]`、`down`、`apn`、`contexts`、`set-apn <APN>`、`clear-apn`、`save-apn <APN>`、`nat on\|off\|status\|plan` |
+| `imei` | 设备身份（带防护） | `read [--index N]`、`probe`、`write <IMEI> --index N --yes` |
+| `nv` | NV 视图与带防护的备份/恢复 | `list`、`hash <分区> [--head 字节数]`、`backup [--dir D]`、`restore <分区> <镜像> --yes` |
+| `diag` | 诊断 | `channels`、`spools`、`mailbox`、`asserts`、`urc`、`all` |
+| `serve` | G2：常驻持有者 | `[--socket 路径]`、`[--seconds N]`；客户端使用 `--socket` 加能力名，或请求 `state`、`urc`、`messages` |
+| `web` | W7：浏览器界面 | `web [地址:端口]`（须配合 `--socket`） |
 
-* 位掩码表与编解码都在 `src/unisoc_at.rs`，并有单元测试；
-* 契约写在 `docs/BASEBAND-CONTRACTS.md` §4.2，来源标记为 **researched**；
-* 凡是写操作一律回读校验；
-* 把它们当成"该先试的形状"，而不是"已测的行为"。
+所有写操作均回读校验：例如 `band lock` 写入后立即读回，未生效即判定失败——调制解调器
+接受命令与配置实际生效是两回事。
 
-## 12. 术语表
+强制约束：**一条 AT 通道不允许有两个读者。** 每条 AT 通道持有独占 `flock`，第二个实例
+以退出码 3 明确失败，而不会静默地分走一部分数据——SIPC 通道对未读取的内容会排队，
+第二个读者不会报错，只会导致双方都无法获得完整应答。身份（IMEI）与 NV 写入经由带防护
+的路径进行（`imei read`/`probe`/`write`、`nv backup`/`restore`，见契约第 8 节）：需在
+profile 中显式启用、写前备份、写后回读。
 
-| 词 | 含义 |
+本代 CP 的专有指令（频段/小区锁定、5G SA/NSA、VoLTE/VoNR、UE 用途设置）来源于对该
+调制解调器自身 AT 接口的调研，而非厂商文档。位掩码表与编解码位于 `src/unisoc_at.rs` 并有
+单元测试，契约见 `docs/BASEBAND-CONTRACTS.md` §4.2（来源标记为 researched）。
+
+## 附录 B：术语
+
+| 术语 | 含义 |
 |---|---|
-| **CP** | Communication Processor，即基带处理器（相对 AP 应用处理器） |
-| **AP** | Application Processor，跑 Linux 的这一侧 |
-| **SIPC** | Unisoc 的处理器间通信通道；`/dev/stty_nr*` 就是它的 tty 视图 |
-| **URC** | Unsolicited Result Code，调制解调器主动上报，如 `+CGEV:`、`+CEREG:` |
-| **AT 通道 / URC 通道** | 本代分两个：`nr1` 是干净的命令通道，`nr0` 是 URC 通道，必须持续读 |
-| **限速（pacing）** | 两条命令之间的最小间隔。不限速会把 CP 的队列塞满，触发 `CP assert ... The queue was full` |
-| **AcT** | Access Technology，接入制式。`+CEREG` 的第 5 个字段：11 = NR SA，13 = EN-DC/NSA |
-| **PDP / 承载** | 数据上下文及其网卡（`sipa_eth0`） |
-| **spool** | CP 往 AP 方向的日志/转储通道 |
-| **profile** | 一份 TOML，描述某个平台的全部板级事实 |
-| **native / vendor 模式** | 前者我们干，后者厂商守护进程干、我们只记录 |
-| **浸泡（soak）** | 长时间（计划要求 72 小时）连续运行，检 0 assert、0 AT 静默 |
+| CP | Communication Processor，基带处理器（相对于应用处理器 AP） |
+| AP | Application Processor，运行 Linux 的一侧 |
+| SIPC | Unisoc 的处理器间通信机制；`/dev/stty_nr*` 为其 tty 接口 |
+| URC | Unsolicited Result Code，调制解调器主动上报的结果码，如 `+CGEV:`、`+CEREG:` |
+| AT 通道 / URC 通道 | 本代分为两条：`nr1` 为命令通道，`nr0` 为 URC 通道，后者必须持续读取 |
+| 限速（pacing） | 两条命令之间的最小间隔；不限速会塞满 CP 的队列并触发 `CP assert ... The queue was full` |
+| AcT | Access Technology，接入技术；`+CEREG` 第 5 个字段，11 为 NR SA，13 为 EN-DC/NSA |
+| PDP / 承载 | 数据上下文及其网卡（`sipa_eth0`） |
+| spool | CP 向 AP 方向的日志/转储通道 |
+| profile | 描述某一平台全部板级信息的 TOML 文件 |
+| native / vendor 模式 | 前者由本项目执行，后者由厂商守护进程执行、本项目仅记录 |
+| 浸泡（soak） | 长时间连续运行（计划要求 72 小时），检验 0 次 assert 与 AT 无静默 |
 
-## 13. 许可
+## 许可
 
-MIT，与仓库其余部分一致。
+MIT，与本仓库其余部分一致。`src/unisoc_at.rs` 中的本代专有 AT 指令来自对该代 CP 自身
+AT 接口的调研；相应契约记录于 `docs/BASEBAND-CONTRACTS.md`。
